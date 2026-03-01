@@ -1,0 +1,7 @@
+{
+  "name": "FoodAppi - PWA Food Delivery & POS",
+  "description": "A comprehensive PWA for food delivery, WhatsApp ordering, and restaurant POS management.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}

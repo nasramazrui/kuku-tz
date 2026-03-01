@@ -1,0 +1,21 @@
+{
+  "short_name": "FoodAppi",
+  "name": "FoodAppi - Food Delivery & POS",
+  "icons": [
+    {
+      "src": "https://picsum.photos/seed/foodappi/192/192",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "https://picsum.photos/seed/foodappi/512/512",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#ffffff",
+  "display": "standalone",
+  "theme_color": "#10b981",
+  "description": "Comprehensive food delivery and restaurant management system."
+}
