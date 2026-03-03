@@ -52,9 +52,13 @@ export const useCartStore = create<CartState>()(
 interface AuthState {
   user: FirebaseUser | null;
   branchUser: any | null;
+  waiterUser: any | null;
+  kitchenUser: any | null;
   loading: boolean;
   setUser: (user: FirebaseUser | null) => void;
   setBranchUser: (branch: any | null) => void;
+  setWaiterUser: (waiter: any | null) => void;
+  setKitchenUser: (kitchen: any | null) => void;
   setLoading: (loading: boolean) => void;
   logout: () => void;
 }
@@ -64,13 +68,17 @@ export const useAuthStore = create<AuthState>()(
     (set) => ({
       user: null,
       branchUser: null,
+      waiterUser: null,
+      kitchenUser: null,
       loading: true,
       setUser: (user) => set({ user, loading: false }),
       setBranchUser: (branchUser) => set({ branchUser, loading: false }),
+      setWaiterUser: (waiterUser) => set({ waiterUser, loading: false }),
+      setKitchenUser: (kitchenUser) => set({ kitchenUser, loading: false }),
       setLoading: (loading) => set({ loading }),
       logout: () => {
         auth.signOut();
-        set({ user: null, branchUser: null });
+        set({ user: null, branchUser: null, waiterUser: null, kitchenUser: null });
       },
     }),
     { name: 'auth-storage' }

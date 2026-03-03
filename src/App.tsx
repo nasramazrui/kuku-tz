@@ -1219,27 +1219,58 @@ const LoginPage = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
+  const { setBranchUser, setWaiterUser, setKitchenUser, setUser } = useAuthStore();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     try {
-      // Try Branch Login first
-      const branchLoginRes = await fetch('/api/auth/branch-login', {
+      // 1. Try Branch Login
+      const branchRes = await fetch('/api/auth/branch/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: identifier, password })
+        body: JSON.stringify({ identifier, password })
       });
-
-      if (branchLoginRes.ok) {
-        const data = await branchLoginRes.json();
-        useAuthStore.getState().setBranchUser(data.branch);
-        toast.success(`Welcome back, ${data.branch.name}!`);
-        navigate('/admin');
+      
+      if (branchRes.ok) {
+        const data = await branchRes.json();
+        setBranchUser(data.data);
+        toast.success(`Welcome back, Branch: ${data.data.name}`);
+        navigate('/branch');
         return;
       }
 
-      // If not branch, try Firebase User Login
+      // 2. Try Waiter Login
+      const waiterRes = await fetch('/api/auth/waiter/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier, password })
+      });
+
+      if (waiterRes.ok) {
+        const data = await waiterRes.json();
+        setWaiterUser(data.data);
+        toast.success(`Welcome back, Waiter: ${data.data.name}`);
+        navigate('/waiter');
+        return;
+      }
+
+      // 3. Try Kitchen Login
+      const kitchenRes = await fetch('/api/auth/kitchen/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier, password })
+      });
+
+      if (kitchenRes.ok) {
+        const data = await kitchenRes.json();
+        setKitchenUser(data.data);
+        toast.success(`Welcome back, Kitchen: ${data.data.name}`);
+        navigate('/kitchen');
+        return;
+      }
+
+      // 4. Try User/Admin Login (Firebase)
       // Lookup email by identifier (name, email, or phone)
       const lookupRes = await fetch('/api/auth/lookup', {
         method: 'POST',
@@ -1252,7 +1283,7 @@ const LoginPage = () => {
         const data = await lookupRes.json();
         email = data.email;
       } else if (!identifier.includes('@')) {
-        throw new Error('User not found with this identifier. Please use Email, Phone or Name.');
+        throw new Error('User not found. Please check your credentials.');
       }
 
       const { user } = await signInWithEmailAndPassword(auth, email, password);
@@ -1263,7 +1294,7 @@ const LoginPage = () => {
         navigate('/');
       }
     } catch (error: any) {
-      toast.error(error.message);
+      toast.error(error.message || "Login failed. Please check your credentials.");
     } finally {
       setLoading(false);
     }
@@ -2265,6 +2296,17 @@ const InvoiceModal = ({ order, isOpen, onClose }: { order: any, isOpen: boolean,
               </table>
 
               <div className="space-y-2 border-t border-dashed border-gray-200 pt-4 mb-8">
+                {(order.notes || order.order_notes) && (
+                  <div className="p-4 bg-orange-50 rounded-2xl border border-orange-100 mb-4">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-orange-600 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-[10px] font-black text-orange-600 uppercase tracking-widest mb-1">Order Notes</p>
+                        <p className="text-xs font-bold text-gray-700">{order.notes || order.order_notes}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div className="flex justify-between text-xs">
                   <span className="font-bold text-gray-400 uppercase">Sub Total</span>
                   <span className="font-black text-gray-900">${(order.subtotal || order.total_amount).toFixed(2)}</span>
@@ -2321,8 +2363,12 @@ const POSPage = () => {
   const [newCustomer, setNewCustomer] = useState({ name: '', phone: '', email: '', password: 'password123' });
   const [tables, setTables] = useState<any[]>([]);
   const [selectedTable, setSelectedTable] = useState<any>(null);
-  const { branch } = useAppStore();
+  const [orderNotes, setOrderNotes] = useState('');
+  const { branch: globalBranch } = useAppStore();
+  const { branchUser, waiterUser } = useAuthStore();
   const { sendMessage } = useWebSocket(() => {});
+
+  const currentBranchId = branchUser?.id || waiterUser?.branch_id || globalBranch?.id || 1;
 
   const subtotal = posCart.reduce((acc, item) => acc + (item.price * item.quantity), 0);
   const total = subtotal - discount;
@@ -2336,7 +2382,7 @@ const POSPage = () => {
       fetch('/api/categories'),
       fetch('/api/items'),
       fetch('/api/admin/orders'),
-      fetch(`/api/dining-tables/branch/${branch?.id || 1}`)
+      fetch(`/api/dining-tables/branch/${currentBranchId}`)
     ]);
     
     setCategories(await catsRes.json());
@@ -2353,7 +2399,7 @@ const POSPage = () => {
 
   useEffect(() => {
     fetchData();
-  }, [branch]);
+  }, [currentBranchId]);
 
   const filteredItems = items.filter(i => {
     const catMatch = selectedCategory ? i.category_id === selectedCategory : true;
@@ -2361,13 +2407,19 @@ const POSPage = () => {
     return catMatch && searchMatch;
   });
 
-  const handleAddToCart = (item: any) => {
-    setPosCart([...posCart, item]);
+  const handleAddToCart = (item: any, options: any = {}, notes: string = '') => {
+    setPosCart([...posCart, { ...item, selectedOptions: options, notes, quantity: item.quantity || 1 }]);
   };
 
   const updateQuantity = (idx: number, delta: number) => {
     const newCart = [...posCart];
     newCart[idx].quantity = Math.max(1, newCart[idx].quantity + delta);
+    setPosCart(newCart);
+  };
+
+  const updateItemNotes = (idx: number, notes: string) => {
+    const newCart = [...posCart];
+    newCart[idx].notes = notes;
     setPosCart(newCart);
   };
 
@@ -2381,10 +2433,15 @@ const POSPage = () => {
       return;
     }
 
+    if (posCart.length === 0) {
+      toast.error('Cart is empty');
+      return;
+    }
+
     const orderData = {
       customer_name: selectedCustomer?.customer_name || 'Walking Customer',
       customer_phone: selectedCustomer?.customer_phone || '',
-      branch_id: branch?.id || 1,
+      branch_id: currentBranchId,
       total_amount: total,
       subtotal,
       discount,
@@ -2394,36 +2451,46 @@ const POSPage = () => {
       change_amount: (parseFloat(receivedAmount) || total) - total,
       transaction_id: transactionId,
       table_id: selectedTable?.id || null,
+      waiter_id: waiterUser?.id || null,
+      notes: orderNotes,
       items: posCart
     };
 
-    const res = await fetch('/api/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(orderData)
-    });
+    try {
+      const res = await fetch('/api/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(orderData)
+      });
 
-    if (res.ok) {
-      const data = await res.json();
+      if (res.ok) {
+        const data = await res.json();
 
-      // Update table occupancy if dine-in
-      if (orderType === 'dine-in' && selectedTable) {
-        await fetch(`/api/admin/dining-tables/${selectedTable.id}/occupancy`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ is_occupied: true })
-        });
+        // Update table occupancy if dine-in
+        if (orderType === 'dine-in' && selectedTable) {
+          await fetch(`/api/admin/dining-tables/${selectedTable.id}/occupancy`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ is_occupied: true })
+          });
+        }
+
+        setLastOrder({ ...orderData, orderId: data.orderId, token_no: data.token_no });
+        setShowPaymentModal(false);
+        setShowInvoiceModal(true);
+        setPosCart([]);
+        setDiscount(0);
+        setReceivedAmount('');
+        setTransactionId('');
+        setSelectedTable(null);
+        setOrderNotes('');
+        fetchData(); // Refresh tables
+        toast.success('Order sent to kitchen!');
+      } else {
+        toast.error('Failed to process order');
       }
-
-      setLastOrder({ ...orderData, orderId: data.orderId, token_no: data.token_no });
-      setShowPaymentModal(false);
-      setShowInvoiceModal(true);
-      setPosCart([]);
-      setDiscount(0);
-      setReceivedAmount('');
-      setTransactionId('');
-      setSelectedTable(null);
-      fetchData(); // Refresh tables
+    } catch (e) {
+      toast.error('Network error');
     }
   };
 
@@ -2592,29 +2659,51 @@ const POSPage = () => {
             </div>
           ) : (
             posCart.map((item, idx) => (
-              <div key={idx} className="flex items-center gap-4 group">
-                <div className="w-12 h-12 rounded-xl overflow-hidden flex-shrink-0">
-                  <img src={item.image} alt={item.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+              <div key={idx} className="flex flex-col gap-2 p-4 bg-gray-50 rounded-2xl group">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 rounded-xl overflow-hidden flex-shrink-0">
+                    <img src={item.image} alt={item.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <h5 className="font-black text-gray-900 text-xs truncate">{item.name}</h5>
+                    <p className="text-[10px] text-gray-400 font-bold">${item.price.toFixed(2)}</p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button onClick={() => updateQuantity(idx, -1)} className="w-6 h-6 rounded-lg bg-white flex items-center justify-center text-gray-400 hover:text-emerald-500 transition-colors shadow-sm">
+                      <MinusSquare className="w-4 h-4" />
+                    </button>
+                    <span className="font-black text-gray-900 text-xs w-4 text-center">{item.quantity}</span>
+                    <button onClick={() => updateQuantity(idx, 1)} className="w-6 h-6 rounded-lg bg-white flex items-center justify-center text-gray-400 hover:text-emerald-500 transition-colors shadow-sm">
+                      <PlusSquare className="w-4 h-4" />
+                    </button>
+                    <button onClick={() => removeItem(idx)} className="w-6 h-6 rounded-lg bg-red-50 flex items-center justify-center text-red-400 hover:bg-red-500 hover:text-white transition-all opacity-0 group-hover:opacity-100">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
-                <div className="flex-1 min-w-0">
-                  <h5 className="font-black text-gray-900 text-xs truncate">{item.name}</h5>
-                  <p className="text-[10px] text-gray-400 font-bold">${item.price.toFixed(2)}</p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button onClick={() => updateQuantity(idx, -1)} className="w-6 h-6 rounded-lg bg-gray-50 flex items-center justify-center text-gray-400 hover:text-emerald-500 transition-colors">
-                    <MinusSquare className="w-4 h-4" />
-                  </button>
-                  <span className="font-black text-gray-900 text-xs w-4 text-center">{item.quantity}</span>
-                  <button onClick={() => updateQuantity(idx, 1)} className="w-6 h-6 rounded-lg bg-gray-50 flex items-center justify-center text-gray-400 hover:text-emerald-500 transition-colors">
-                    <PlusSquare className="w-4 h-4" />
-                  </button>
-                  <button onClick={() => removeItem(idx)} className="w-6 h-6 rounded-lg bg-red-50 flex items-center justify-center text-red-400 hover:bg-red-500 hover:text-white transition-all opacity-0 group-hover:opacity-100">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
+                <input 
+                  type="text"
+                  placeholder="Add item note (e.g. No spicy)"
+                  value={item.notes || ''}
+                  onChange={e => updateItemNotes(idx, e.target.value)}
+                  className="w-full px-3 py-2 bg-white border-none rounded-xl text-[10px] font-medium focus:ring-1 focus:ring-emerald-500"
+                />
               </div>
             ))
           )}
+        </div>
+
+        {/* Order Notes */}
+        <div className="px-6 py-4 bg-white border-t border-gray-100">
+          <div className="space-y-2">
+            <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Order Notes</label>
+            <textarea 
+              placeholder="General instructions for this order..."
+              value={orderNotes}
+              onChange={e => setOrderNotes(e.target.value)}
+              className="w-full p-3 bg-gray-50 border-none rounded-2xl text-xs font-medium focus:ring-2 focus:ring-emerald-500 resize-none h-20"
+            />
+          </div>
         </div>
 
         {/* Totals & Actions */}
@@ -2846,23 +2935,27 @@ const POSPage = () => {
 };
 
 const AdminRoute = ({ children }: { children: React.ReactNode }) => {
-  const { user, branchUser, loading } = useAuthStore();
+  const { user, branchUser, waiterUser, kitchenUser, loading } = useAuthStore();
   const navigate = useNavigate();
 
   useEffect(() => {
     const isAdmin = user && user.email === 'amytzee@gmail.com';
     const isBranch = !!branchUser;
+    const isWaiter = !!waiterUser;
+    const isKitchen = !!kitchenUser;
     
-    if (!loading && !isAdmin && !isBranch) {
-      toast.error('Access denied. Admin or Branch only.');
+    if (!loading && !isAdmin && !isBranch && !isWaiter && !isKitchen) {
+      toast.error('Access denied.');
       navigate('/');
     }
-  }, [user, branchUser, loading, navigate]);
+  }, [user, branchUser, waiterUser, kitchenUser, loading, navigate]);
 
   if (loading) return <div className="p-8">Verifying...</div>;
   const isAdmin = user && user.email === 'amytzee@gmail.com';
   const isBranch = !!branchUser;
-  if (!isAdmin && !isBranch) return null;
+  const isWaiter = !!waiterUser;
+  const isKitchen = !!kitchenUser;
+  if (!isAdmin && !isBranch && !isWaiter && !isKitchen) return null;
 
   return <>{children}</>;
 };
@@ -2870,7 +2963,17 @@ const AdminRoute = ({ children }: { children: React.ReactNode }) => {
 const AdminLayout = ({ children, title }: { children: React.ReactNode, title: string }) => {
   const navigate = useNavigate();
   const location = useLocation();
+  const { user, branchUser, waiterUser, kitchenUser, logout } = useAuthStore();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  const displayName = user?.email === 'amytzee@gmail.com' ? 'Administrator' : (branchUser?.name || waiterUser?.name || kitchenUser?.name || 'User');
+  const displayRole = user?.email === 'amytzee@gmail.com' ? 'Super Admin' : (branchUser ? 'Branch Manager' : (waiterUser ? 'Waiter' : (kitchenUser ? 'Kitchen Staff' : 'Staff')));
+  const initials = displayName.substring(0, 2).toUpperCase();
+
+  const handleLogout = () => {
+    logout();
+    navigate('/');
+  };
 
   const menuItems = [
     { icon: LayoutDashboard, label: 'Dashboard', path: '/admin' },
@@ -2894,6 +2997,8 @@ const AdminLayout = ({ children, title }: { children: React.ReactNode, title: st
     { icon: Users, label: 'Subscribers', path: '/admin/subscribers' },
     { type: 'header', label: 'USERS' },
     { icon: Users, label: 'User Management', path: '/admin/users' },
+    { icon: Users, label: 'Waiters', path: '/admin/waiters' },
+    { icon: Utensils, label: 'Kitchen Staff', path: '/admin/kitchen-staff' },
     { icon: Settings, label: 'Settings', path: '/admin/settings' },
   ];
 
@@ -2984,11 +3089,14 @@ const AdminLayout = ({ children, title }: { children: React.ReactNode, title: st
           </div>
           <div className="flex items-center gap-2 lg:gap-4">
             <div className="hidden sm:flex flex-col items-end mr-2">
-              <span className="text-xs font-bold text-gray-900">Admin User</span>
-              <span className="text-[10px] text-gray-400 font-black uppercase tracking-widest">Administrator</span>
+              <span className="text-xs font-bold text-gray-900">{displayName}</span>
+              <span className="text-[10px] text-gray-400 font-black uppercase tracking-widest">{displayRole}</span>
             </div>
-            <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 font-bold shadow-inner">AD</div>
-            <button className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all">
+            <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 font-bold shadow-inner">{initials}</div>
+            <button 
+              onClick={handleLogout}
+              className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all"
+            >
               <LogOut className="w-5 h-5" />
             </button>
           </div>
@@ -3206,6 +3314,269 @@ const AdminUsers = () => {
           </motion.div>
         </div>
       )}
+    </AdminLayout>
+  );
+};
+
+const AdminWaiters = () => {
+  const [waiters, setWaiters] = useState<any[]>([]);
+  const [branches, setBranches] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingWaiter, setEditingWaiter] = useState<any>(null);
+  const [formData, setFormData] = useState({
+    name: '',
+    branch_id: '',
+    email: '',
+    phone: '',
+    password: '',
+    is_active: true
+  });
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [waitersRes, branchesRes] = await Promise.all([
+        fetch('/api/admin/waiters'),
+        fetch('/api/admin/branches')
+      ]);
+      setWaiters(await waitersRes.json());
+      const branchesData = await branchesRes.json();
+      setBranches(branchesData);
+      if (branchesData.length > 0 && !formData.branch_id) {
+        setFormData(prev => ({ ...prev, branch_id: branchesData[0].id }));
+      }
+    } catch (e) {
+      toast.error("Failed to fetch data");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const url = editingWaiter ? `/api/admin/waiters/${editingWaiter.id}` : '/api/admin/waiters';
+    const method = editingWaiter ? 'PUT' : 'POST';
+
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData)
+      });
+      if (res.ok) {
+        toast.success(editingWaiter ? 'Waiter updated' : 'Waiter added');
+        setIsModalOpen(false);
+        setEditingWaiter(null);
+        setFormData({ name: '', branch_id: branches[0]?.id || '', email: '', phone: '', password: '', is_active: true });
+        fetchData();
+      } else {
+        const data = await res.json();
+        toast.error(data.error || "Operation failed");
+      }
+    } catch (e) {
+      toast.error("Operation failed");
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (confirm('Are you sure?')) {
+      const res = await fetch(`/api/admin/waiters/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        toast.success('Waiter deleted');
+        fetchData();
+      }
+    }
+  };
+
+  return (
+    <AdminLayout title="Waiter Management">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+        <h2 className="text-lg font-bold text-gray-900">Waiters</h2>
+        <button 
+          onClick={() => {
+            setEditingWaiter(null);
+            setFormData({ name: '', branch_id: branches[0]?.id || '', email: '', phone: '', password: '', is_active: true });
+            setIsModalOpen(true);
+          }}
+          className="w-full sm:w-auto bg-pink-600 text-white px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-pink-500/20 hover:bg-pink-700 transition-all"
+        >
+          <PlusCircle className="w-5 h-5" /> Add Waiter
+        </button>
+      </div>
+
+      <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="bg-gray-50 text-gray-400 text-[10px] font-black uppercase tracking-widest">
+                <th className="px-8 py-4">Name</th>
+                <th className="px-8 py-4">Branch</th>
+                <th className="px-8 py-4">Contact</th>
+                <th className="px-8 py-4">Status</th>
+                <th className="px-8 py-4">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {waiters.map((waiter) => (
+                <tr key={waiter.id} className="hover:bg-gray-50 transition-colors">
+                  <td className="px-8 py-4">
+                    <div className="text-sm font-bold text-gray-900">{waiter.name}</div>
+                  </td>
+                  <td className="px-8 py-4">
+                    <div className="text-sm font-bold text-emerald-600">{waiter.branch_name}</div>
+                  </td>
+                  <td className="px-8 py-4">
+                    <div className="text-xs font-bold text-gray-600">{waiter.email}</div>
+                    <div className="text-xs text-gray-400">{waiter.phone}</div>
+                  </td>
+                  <td className="px-8 py-4">
+                    <span className={cn(
+                      "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                      waiter.is_active ? "bg-emerald-100 text-emerald-600" : "bg-red-100 text-red-600"
+                    )}>
+                      {waiter.is_active ? 'Active' : 'Inactive'}
+                    </span>
+                  </td>
+                  <td className="px-8 py-4">
+                    <div className="flex items-center gap-2">
+                      <button 
+                        onClick={() => {
+                          setEditingWaiter(waiter);
+                          setFormData({
+                            name: waiter.name,
+                            branch_id: waiter.branch_id,
+                            email: waiter.email || '',
+                            phone: waiter.phone || '',
+                            password: waiter.password,
+                            is_active: !!waiter.is_active
+                          });
+                          setIsModalOpen(true);
+                        }}
+                        className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={() => handleDelete(waiter.id)}
+                        className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <AnimatePresence>
+        {isModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsModalOpen(false)}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              className="relative w-full max-w-md bg-white rounded-[2.5rem] shadow-2xl overflow-hidden"
+            >
+              <div className="p-8 border-b border-gray-100 flex items-center justify-between bg-gray-50/50">
+                <h3 className="text-xl font-black text-gray-900">{editingWaiter ? 'Edit Waiter' : 'Add New Waiter'}</h3>
+                <button onClick={() => setIsModalOpen(false)} className="p-2 hover:bg-white rounded-full transition-colors">
+                  <X className="w-6 h-6 text-gray-400" />
+                </button>
+              </div>
+              <form onSubmit={handleSubmit} className="p-8 space-y-6">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Waiter Name</label>
+                  <input 
+                    type="text"
+                    required
+                    value={formData.name}
+                    onChange={e => setFormData({...formData, name: e.target.value})}
+                    className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-emerald-500 font-bold text-sm"
+                    placeholder="Enter waiter name"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Branch</label>
+                  <select 
+                    required
+                    value={formData.branch_id}
+                    onChange={e => setFormData({...formData, branch_id: e.target.value})}
+                    className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-emerald-500 font-bold text-sm"
+                  >
+                    {branches.map(b => (
+                      <option key={b.id} value={b.id}>{b.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Email</label>
+                    <input 
+                      type="email"
+                      value={formData.email}
+                      onChange={e => setFormData({...formData, email: e.target.value})}
+                      className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-emerald-500 font-bold text-sm"
+                      placeholder="Email"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Phone</label>
+                    <input 
+                      type="text"
+                      value={formData.phone}
+                      onChange={e => setFormData({...formData, phone: e.target.value})}
+                      className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-emerald-500 font-bold text-sm"
+                      placeholder="Phone"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Password</label>
+                  <input 
+                    type="password"
+                    required
+                    value={formData.password}
+                    onChange={e => setFormData({...formData, password: e.target.value})}
+                    className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-emerald-500 font-bold text-sm"
+                    placeholder="Enter password"
+                  />
+                </div>
+                <div className="flex items-center gap-3">
+                  <input 
+                    type="checkbox"
+                    id="is_active"
+                    checked={formData.is_active}
+                    onChange={e => setFormData({...formData, is_active: e.target.checked})}
+                    className="w-5 h-5 text-emerald-600 rounded-lg focus:ring-emerald-500"
+                  />
+                  <label htmlFor="is_active" className="text-sm font-bold text-gray-600">Active Account</label>
+                </div>
+                <button 
+                  type="submit"
+                  className="w-full bg-emerald-500 text-white py-5 rounded-2xl font-black uppercase tracking-widest shadow-xl shadow-emerald-500/30 hover:bg-emerald-600 transition-all"
+                >
+                  {editingWaiter ? 'Update Waiter' : 'Save Waiter'}
+                </button>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </AdminLayout>
   );
 };
@@ -3653,14 +4024,17 @@ const AdminDiningTables = () => {
 
 const AdminDashboard = () => {
   const [stats, setStats] = useState<any>(null);
-  const { branchUser } = useAuthStore();
+  const { user, branchUser, waiterUser } = useAuthStore();
 
   useEffect(() => {
-    const url = branchUser ? `/api/admin/stats?branchId=${branchUser.id}` : '/api/admin/stats';
+    const branchId = branchUser?.id || waiterUser?.branch_id;
+    const url = branchId ? `/api/admin/stats?branchId=${branchId}` : '/api/admin/stats';
     fetch(url).then(res => res.json()).then(setStats);
-  }, [branchUser]);
+  }, [branchUser, waiterUser]);
 
   if (!stats) return <div className="p-8">Loading...</div>;
+
+  const displayName = user?.email === 'amytzee@gmail.com' ? 'Administrator' : (branchUser?.name || waiterUser?.name || 'User');
 
   const COLORS = ['#ec4899', '#8b5cf6', '#3b82f6', '#a855f7', '#10b981', '#f59e0b', '#ef4444'];
 
@@ -3685,7 +4059,7 @@ const AdminDashboard = () => {
       {/* Greeting */}
       <div className="mb-6 lg:mb-10">
         <h2 className="text-2xl lg:text-3xl font-black text-pink-600 mb-1">Good Morning!</h2>
-        <p className="text-base lg:text-lg font-bold text-gray-900">John Doe</p>
+        <p className="text-base lg:text-lg font-bold text-gray-900">{displayName}</p>
       </div>
 
       {/* Overview Cards */}
@@ -3926,10 +4300,11 @@ const AdminDashboard = () => {
 const AdminOrders = () => {
   const [orders, setOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const { branchUser } = useAuthStore();
+  const { branchUser, waiterUser } = useAuthStore();
 
   const fetchOrders = async () => {
-    const url = branchUser ? `/api/admin/orders?branchId=${branchUser.id}` : '/api/admin/orders';
+    const branchId = branchUser?.id || waiterUser?.branch_id;
+    const url = branchId ? `/api/admin/orders?branchId=${branchId}` : '/api/admin/orders';
     const res = await fetch(url);
     const data = await res.json();
     setOrders(data);
@@ -3938,7 +4313,7 @@ const AdminOrders = () => {
 
   useEffect(() => {
     fetchOrders();
-  }, [branchUser]);
+  }, [branchUser, waiterUser]);
 
   const updateStatus = async (id: number, status: string) => {
     await fetch(`/api/admin/orders/${id}/status`, {
@@ -3976,6 +4351,7 @@ const AdminOrders = () => {
                 <th className="px-8 py-4">Branch</th>
                 <th className="px-8 py-4">Amount</th>
                 <th className="px-8 py-4">Type</th>
+                <th className="px-8 py-4">Notes</th>
                 <th className="px-8 py-4">Status</th>
                 <th className="px-8 py-4">Actions</th>
               </tr>
@@ -3992,6 +4368,16 @@ const AdminOrders = () => {
                   <td className="px-8 py-4 font-bold text-emerald-600">${order.total_amount.toFixed(2)}</td>
                   <td className="px-8 py-4">
                     <span className="text-[10px] font-bold uppercase text-gray-400">{order.order_type}</span>
+                  </td>
+                  <td className="px-8 py-4">
+                    {order.notes ? (
+                      <div className="flex items-center gap-2 text-orange-600 bg-orange-50 px-3 py-1 rounded-lg w-fit">
+                        <AlertCircle className="w-3 h-3" />
+                        <span className="text-[10px] font-black uppercase tracking-wider truncate max-w-[150px]">{order.notes}</span>
+                      </div>
+                    ) : (
+                      <span className="text-[10px] text-gray-300 italic">No notes</span>
+                    )}
                   </td>
                   <td className="px-8 py-4">
                     <select 
@@ -4619,27 +5005,33 @@ const AdminSettings = () => {
       <div className="grid grid-cols-1 gap-8">
         {/* Branches Management */}
         <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
-          <div className="p-8 border-b border-gray-100 flex items-center justify-between">
+          <div className="p-6 lg:p-8 border-b border-gray-100 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <h2 className="text-lg font-bold text-gray-900">Branches</h2>
             <button 
               onClick={() => {
                 setEditingBranch(null);
-                setBranchForm({ name: '', address: '', is_active: true });
+                setBranchForm({ name: '', address: '', email: '', password: '', latitude: '', longitude: '', is_active: true });
                 setIsBranchModalOpen(true);
               }}
-              className="text-emerald-600 hover:text-emerald-700 text-sm font-bold flex items-center gap-1"
+              className="w-full sm:w-auto bg-emerald-500 text-white px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 hover:bg-emerald-600 transition-all"
             >
               <Plus className="w-4 h-4" /> Add Branch
             </button>
           </div>
-          <div className="p-8 space-y-4">
+          <div className="p-6 lg:p-8 space-y-4">
             {branches.map((branch) => (
-              <div key={branch.id} className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl">
-                <div>
-                  <div className="font-bold text-gray-900">{branch.name}</div>
-                  <div className="text-xs text-gray-400">{branch.address}</div>
+              <div key={branch.id} className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-gray-50 rounded-2xl gap-4">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 bg-emerald-100 rounded-xl flex items-center justify-center text-emerald-600 shrink-0">
+                    <MapPin className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <div className="font-bold text-gray-900">{branch.name}</div>
+                    <div className="text-xs text-gray-400">{branch.email}</div>
+                    <div className="text-[10px] text-gray-400 font-medium uppercase tracking-widest mt-0.5">{branch.address}</div>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
                   <button 
                     onClick={() => {
                       setEditingBranch(branch);
@@ -4654,12 +5046,20 @@ const AdminSettings = () => {
                       });
                       setIsBranchModalOpen(true);
                     }}
-                    className="p-2 text-blue-600 hover:bg-blue-100 rounded-lg transition-colors"
+                    className="p-3 text-blue-600 hover:bg-blue-100 rounded-xl transition-colors"
                   >
-                    <Edit2 className="w-4 h-4" />
+                    <Edit2 className="w-5 h-5" />
                   </button>
-                  <button className="p-2 text-red-600 hover:bg-red-100 rounded-lg transition-colors">
-                    <Trash2 className="w-4 h-4" />
+                  <button 
+                    onClick={async () => {
+                      if (confirm('Are you sure?')) {
+                        await fetch(`/api/admin/branches/${branch.id}`, { method: 'DELETE' });
+                        fetchData();
+                      }
+                    }}
+                    className="p-3 text-red-600 hover:bg-red-100 rounded-xl transition-colors"
+                  >
+                    <Trash2 className="w-5 h-5" />
                   </button>
                 </div>
               </div>
@@ -4773,6 +5173,737 @@ const AdminSettings = () => {
           </div>
         )}
       </AnimatePresence>
+    </AdminLayout>
+  );
+};
+
+const AdminKitchenStaff = () => {
+  const [staff, setStaff] = useState<any[]>([]);
+  const [branches, setBranches] = useState<any[]>([]);
+  const [kitchens, setKitchens] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingStaff, setEditingStaff] = useState<any>(null);
+  const [formData, setFormData] = useState({
+    name: '',
+    branch_id: '',
+    kitchen_id: '',
+    email: '',
+    phone: '',
+    password: '',
+    is_active: true
+  });
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [staffRes, branchesRes, kitchensRes] = await Promise.all([
+        fetch('/api/admin/kitchen-staff'),
+        fetch('/api/admin/branches'),
+        fetch('/api/admin/kitchens')
+      ]);
+      setStaff(await staffRes.json());
+      const branchesData = await branchesRes.json();
+      const kitchensData = await kitchensRes.json();
+      setBranches(branchesData);
+      setKitchens(kitchensData);
+      
+      if (branchesData.length > 0 && !formData.branch_id) {
+        setFormData(prev => ({ ...prev, branch_id: branchesData[0].id }));
+      }
+      if (kitchensData.length > 0 && !formData.kitchen_id) {
+        setFormData(prev => ({ ...prev, kitchen_id: kitchensData[0].id }));
+      }
+    } catch (e) {
+      toast.error("Failed to fetch data");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const url = editingStaff ? `/api/admin/kitchen-staff/${editingStaff.id}` : '/api/admin/kitchen-staff';
+    const method = editingStaff ? 'PUT' : 'POST';
+
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData)
+      });
+      if (res.ok) {
+        toast.success(editingStaff ? 'Staff updated' : 'Staff added');
+        setIsModalOpen(false);
+        setEditingStaff(null);
+        setFormData({ name: '', branch_id: branches[0]?.id || '', kitchen_id: kitchens[0]?.id || '', email: '', phone: '', password: '', is_active: true });
+        fetchData();
+      } else {
+        const data = await res.json();
+        toast.error(data.error || "Operation failed");
+      }
+    } catch (e) {
+      toast.error("Operation failed");
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (confirm('Are you sure?')) {
+      const res = await fetch(`/api/admin/kitchen-staff/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        toast.success('Staff deleted');
+        fetchData();
+      }
+    }
+  };
+
+  return (
+    <AdminLayout title="Kitchen Staff Management">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+        <h2 className="text-lg font-bold text-gray-900">Kitchen Staff</h2>
+        <button 
+          onClick={() => {
+            setEditingStaff(null);
+            setFormData({ name: '', branch_id: branches[0]?.id || '', kitchen_id: kitchens[0]?.id || '', email: '', phone: '', password: '', is_active: true });
+            setIsModalOpen(true);
+          }}
+          className="w-full sm:w-auto bg-orange-600 text-white px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-orange-500/20 hover:bg-orange-700 transition-all"
+        >
+          <PlusCircle className="w-5 h-5" /> Add Kitchen Staff
+        </button>
+      </div>
+
+      <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left">
+            <thead>
+              <tr className="bg-gray-50 text-gray-400 text-[10px] font-black uppercase tracking-widest">
+                <th className="px-8 py-4">Name</th>
+                <th className="px-8 py-4">Branch / Kitchen</th>
+                <th className="px-8 py-4">Contact</th>
+                <th className="px-8 py-4">Status</th>
+                <th className="px-8 py-4">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {staff.map((s) => (
+                <tr key={s.id} className="hover:bg-gray-50 transition-colors">
+                  <td className="px-8 py-4">
+                    <div className="text-sm font-bold text-gray-900">{s.name}</div>
+                  </td>
+                  <td className="px-8 py-4">
+                    <div className="text-sm font-bold text-emerald-600">{s.branch_name}</div>
+                    <div className="text-[10px] font-black text-orange-600 uppercase tracking-widest">{s.kitchen_name}</div>
+                  </td>
+                  <td className="px-8 py-4">
+                    <div className="text-xs font-bold text-gray-600">{s.email}</div>
+                    <div className="text-xs text-gray-400">{s.phone}</div>
+                  </td>
+                  <td className="px-8 py-4">
+                    <span className={cn(
+                      "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                      s.is_active ? "bg-emerald-100 text-emerald-600" : "bg-red-100 text-red-600"
+                    )}>
+                      {s.is_active ? 'Active' : 'Inactive'}
+                    </span>
+                  </td>
+                  <td className="px-8 py-4">
+                    <div className="flex items-center gap-2">
+                      <button 
+                        onClick={() => {
+                          setEditingStaff(s);
+                          setFormData({
+                            name: s.name,
+                            branch_id: s.branch_id,
+                            kitchen_id: s.kitchen_id,
+                            email: s.email || '',
+                            phone: s.phone || '',
+                            password: s.password,
+                            is_active: !!s.is_active
+                          });
+                          setIsModalOpen(true);
+                        }}
+                        className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={() => handleDelete(s.id)}
+                        className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Modal */}
+      <AnimatePresence>
+        {isModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsModalOpen(false)}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              className="relative w-full max-w-lg bg-white rounded-[2.5rem] shadow-2xl overflow-hidden"
+            >
+              <div className="p-8 lg:p-10">
+                <div className="flex items-center justify-between mb-8">
+                  <h3 className="text-2xl font-black text-gray-900">{editingStaff ? 'Edit Staff' : 'Add Kitchen Staff'}</h3>
+                  <button onClick={() => setIsModalOpen(false)} className="p-2 hover:bg-gray-100 rounded-full transition-colors">
+                    <X className="w-6 h-6 text-gray-400" />
+                  </button>
+                </div>
+                <form onSubmit={handleSubmit} className="space-y-6">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Full Name</label>
+                      <input 
+                        type="text"
+                        required
+                        value={formData.name}
+                        onChange={e => setFormData({ ...formData, name: e.target.value })}
+                        className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-orange-500 font-bold text-sm"
+                        placeholder="Staff name"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Branch</label>
+                      <select 
+                        required
+                        value={formData.branch_id}
+                        onChange={e => setFormData({ ...formData, branch_id: e.target.value })}
+                        className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-orange-500 font-bold text-sm"
+                      >
+                        {branches.map(b => (
+                          <option key={b.id} value={b.id}>{b.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Kitchen Section</label>
+                      <select 
+                        required
+                        value={formData.kitchen_id}
+                        onChange={e => setFormData({ ...formData, kitchen_id: e.target.value })}
+                        className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-orange-500 font-bold text-sm"
+                      >
+                        {kitchens.map(k => (
+                          <option key={k.id} value={k.id}>{k.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Email</label>
+                      <input 
+                        type="email"
+                        value={formData.email}
+                        onChange={e => setFormData({ ...formData, email: e.target.value })}
+                        className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-orange-500 font-bold text-sm"
+                        placeholder="email@example.com"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Phone</label>
+                      <input 
+                        type="tel"
+                        value={formData.phone}
+                        onChange={e => setFormData({ ...formData, phone: e.target.value })}
+                        className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-orange-500 font-bold text-sm"
+                        placeholder="Phone number"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Password</label>
+                      <input 
+                        type="password"
+                        required={!editingStaff}
+                        value={formData.password}
+                        onChange={e => setFormData({ ...formData, password: e.target.value })}
+                        className="w-full p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-orange-500 font-bold text-sm"
+                        placeholder="Enter password"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 p-4 bg-gray-50 rounded-2xl">
+                    <input 
+                      type="checkbox"
+                      id="is_active"
+                      checked={formData.is_active}
+                      onChange={e => setFormData({ ...formData, is_active: e.target.checked })}
+                      className="w-5 h-5 text-orange-600 rounded-lg border-none focus:ring-orange-500"
+                    />
+                    <label htmlFor="is_active" className="text-sm font-bold text-gray-700">Active Account</label>
+                  </div>
+                  <button 
+                    type="submit"
+                    className="w-full bg-orange-600 text-white py-5 rounded-2xl font-black uppercase tracking-widest shadow-xl shadow-orange-500/30 hover:bg-orange-700 transition-all"
+                  >
+                    {editingStaff ? 'Update Staff' : 'Add Staff'}
+                  </button>
+                </form>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </AdminLayout>
+  );
+};
+
+const KitchenDashboard = () => {
+  const { kitchenUser, logout } = useAuthStore();
+  const navigate = useNavigate();
+  const [orders, setOrders] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    audioRef.current = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
+  }, []);
+
+  const fetchOrders = async () => {
+    if (!kitchenUser) return;
+    try {
+      const res = await fetch(`/api/kitchen/orders?branchId=${kitchenUser.branch_id}&kitchenId=${kitchenUser.kitchen_id}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.length > orders.length && orders.length > 0) {
+          audioRef.current?.play().catch(e => console.error("Audio play failed", e));
+          toast.success("New Order Received!", { icon: '🔔' });
+        }
+        setOrders(data);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!kitchenUser) {
+      navigate('/login');
+      return;
+    }
+    fetchOrders();
+    const interval = setInterval(fetchOrders, 10000); // Poll every 10s
+    return () => clearInterval(interval);
+  }, [kitchenUser]);
+
+  const updateItemStatus = async (itemId: number, status: string) => {
+    try {
+      const res = await fetch(`/api/kitchen/order-items/${itemId}/status`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status })
+      });
+      if (res.ok) {
+        fetchOrders();
+        toast.success(`Item marked as ${status}`);
+      }
+    } catch (e) {
+      toast.error("Failed to update status");
+    }
+  };
+
+  const getTimerColor = (createdAt: string) => {
+    const start = new Date(createdAt).getTime();
+    const now = new Date().getTime();
+    const diff = (now - start) / 1000 / 60; // mins
+    if (diff > 15) return 'text-red-600 font-black animate-pulse';
+    if (diff > 10) return 'text-orange-600 font-bold';
+    return 'text-emerald-600 font-bold';
+  };
+
+  const getTimeDiff = (createdAt: string) => {
+    const start = new Date(createdAt).getTime();
+    const now = new Date().getTime();
+    const diff = Math.floor((now - start) / 1000);
+    const mins = Math.floor(diff / 60);
+    const secs = diff % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')} mins`;
+  };
+
+  if (!kitchenUser) return null;
+
+  return (
+    <div className="min-h-screen bg-gray-900 p-4 lg:p-8 text-white">
+      <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-8">
+        <div>
+          <h1 className="text-3xl font-black tracking-tighter flex items-center gap-3">
+            <Utensils className="w-8 h-8 text-orange-500" />
+            KITCHEN PANEL: <span className="text-orange-500">{kitchenUser.kitchen_name}</span>
+          </h1>
+          <p className="text-gray-400 font-medium">{kitchenUser.branch_name} • {orders.length} Active Orders</p>
+        </div>
+        <div className="flex items-center gap-4 w-full lg:w-auto">
+          <button 
+            onClick={fetchOrders}
+            className="flex-1 lg:flex-none bg-gray-800 hover:bg-gray-700 text-white px-6 py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2"
+          >
+            <Clock className="w-5 h-5" /> Refresh
+          </button>
+          <button 
+            onClick={() => { logout(); navigate('/login'); }}
+            className="flex-1 lg:flex-none bg-red-600/20 hover:bg-red-600 text-red-500 hover:text-white px-6 py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2"
+          >
+            <LogOut className="w-5 h-5" /> Logout
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="flex items-center justify-center h-64">
+          <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-orange-500"></div>
+        </div>
+      ) : orders.length === 0 ? (
+        <div className="flex flex-col items-center justify-center h-96 bg-gray-800/50 rounded-[3rem] border-2 border-dashed border-gray-700">
+          <div className="w-20 h-20 bg-gray-700 rounded-full flex items-center justify-center mb-4">
+            <ClipboardList className="w-10 h-10 text-gray-500" />
+          </div>
+          <h2 className="text-xl font-bold text-gray-400">No active orders right now</h2>
+          <p className="text-gray-500 mt-2">New orders will appear here automatically</p>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-6">
+          {orders.map((order) => (
+            <motion.div 
+              key={order.order_id}
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="bg-gray-800 rounded-[2.5rem] overflow-hidden border border-gray-700 flex flex-col shadow-2xl"
+            >
+              <div className="p-6 border-b border-gray-700 flex justify-between items-start bg-gray-800/50">
+                <div>
+                  <div className="text-[10px] font-black text-orange-500 uppercase tracking-widest mb-1">Table</div>
+                  <div className="text-3xl font-black">{order.table_name || 'TAKEAWAY'}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Order #{order.token_no}</div>
+                  <div className={cn("text-sm font-bold", getTimerColor(order.created_at))}>
+                    ⏱ {getTimeDiff(order.created_at)}
+                  </div>
+                </div>
+              </div>
+
+              {order.order_notes && (
+                <div className="px-6 py-4 bg-orange-500 text-white border-b border-orange-600">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="w-6 h-6 shrink-0" />
+                    <div>
+                      <div className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-1">Special Order Instructions</div>
+                      <p className="text-lg font-black leading-tight">{order.order_notes}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="p-6 flex-grow space-y-4">
+                {order.items.map((item: any) => (
+                  <div key={item.item_id} className="flex flex-col gap-2 p-4 bg-gray-900/50 rounded-2xl border border-gray-700/50">
+                    <div className="flex justify-between items-start">
+                      <div className="flex items-start gap-3">
+                        <div className="w-8 h-8 bg-orange-500/20 rounded-lg flex items-center justify-center text-orange-500 font-black text-sm shrink-0">
+                          {item.quantity}x
+                        </div>
+                        <div>
+                          <div className="font-bold text-lg leading-tight">{item.item_name}</div>
+                          {Object.entries(item.variations).length > 0 && (
+                            <div className="text-[10px] text-gray-500 font-medium mt-1">
+                              {Object.entries(item.variations).map(([k, v]: any) => `${k}: ${v}`).join(', ')}
+                            </div>
+                          )}
+                          {item.notes && (
+                            <div className="text-xs text-orange-400 font-bold mt-1 italic">
+                              Note: {item.notes}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className={cn(
+                        "px-2 py-1 rounded-lg text-[8px] font-black uppercase tracking-widest",
+                        item.status === 'pending' ? "bg-yellow-500/20 text-yellow-500" :
+                        item.status === 'preparing' ? "bg-orange-500/20 text-orange-500" :
+                        "bg-emerald-500/20 text-emerald-500"
+                      )}>
+                        {item.status}
+                      </div>
+                    </div>
+                    
+                    <div className="flex gap-2 mt-2">
+                      {item.status === 'pending' && (
+                        <button 
+                          onClick={() => updateItemStatus(item.item_id, 'preparing')}
+                          className="flex-1 bg-yellow-500 hover:bg-yellow-600 text-yellow-950 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all"
+                        >
+                          Start Cooking
+                        </button>
+                      )}
+                      {item.status === 'preparing' && (
+                        <button 
+                          onClick={() => updateItemStatus(item.item_id, 'ready')}
+                          className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-emerald-950 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all"
+                        >
+                          Mark Ready
+                        </button>
+                      )}
+                      {item.status === 'ready' && (
+                        <div className="flex-1 bg-emerald-500/10 text-emerald-500 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest text-center border border-emerald-500/20">
+                          Ready to Serve
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="p-6 bg-gray-900/30 border-t border-gray-700">
+                <button 
+                  onClick={() => window.print()}
+                  className="w-full bg-gray-700 hover:bg-gray-600 text-white py-3 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all"
+                >
+                  <Printer className="w-4 h-4" /> Print KOT
+                </button>
+              </div>
+            </motion.div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const WaiterDashboard = () => {
+  const { waiterUser, logout } = useAuthStore();
+  const navigate = useNavigate();
+  const [tables, setTables] = useState<any[]>([]);
+  const [stats, setStats] = useState({
+    total: 0,
+    available: 0,
+    occupied: 0,
+    preparing: 0,
+    ready: 0
+  });
+  const [loading, setLoading] = useState(true);
+
+  const fetchData = async () => {
+    if (!waiterUser) return;
+    try {
+      const [tablesRes, ordersRes] = await Promise.all([
+        fetch(`/api/admin/dining-tables?branchId=${waiterUser.branch_id}`),
+        fetch(`/api/admin/orders?branchId=${waiterUser.branch_id}`)
+      ]);
+      
+      const tablesData = await tablesRes.json();
+      const ordersData = await ordersRes.json();
+      
+      setTables(tablesData);
+      
+      // Calculate stats
+      const occupiedTables = ordersData.filter((o: any) => o.status !== 'completed' && o.status !== 'cancelled' && o.table_id).map((o: any) => o.table_id);
+      const preparingOrders = ordersData.filter((o: any) => o.status === 'preparing');
+      const readyOrders = ordersData.filter((o: any) => o.status === 'ready');
+      
+      setStats({
+        total: tablesData.length,
+        available: tablesData.length - new Set(occupiedTables).size,
+        occupied: new Set(occupiedTables).size,
+        preparing: preparingOrders.length,
+        ready: readyOrders.length
+      });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!waiterUser) {
+      navigate('/login');
+      return;
+    }
+    fetchData();
+    const interval = setInterval(fetchData, 15000);
+    return () => clearInterval(interval);
+  }, [waiterUser]);
+
+  if (!waiterUser) return null;
+
+  return (
+    <div className="min-h-screen bg-gray-50 pb-20">
+      <div className="bg-white border-b border-gray-100 sticky top-0 z-30">
+        <div className="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
+          <div>
+            <h1 className="text-xl font-black text-gray-900">Waiter Panel</h1>
+            <p className="text-xs text-gray-400 font-medium">{waiterUser.branch_name} • {waiterUser.name}</p>
+          </div>
+          <button 
+            onClick={() => { logout(); navigate('/login'); }}
+            className="p-3 bg-red-50 text-red-600 rounded-2xl hover:bg-red-100 transition-all"
+          >
+            <LogOut className="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+
+      <div className="max-w-7xl mx-auto px-4 py-8">
+        {/* Stats Grid */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+          <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-sm">
+            <div className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Available</div>
+            <div className="text-3xl font-black text-emerald-600">{stats.available}</div>
+          </div>
+          <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-sm">
+            <div className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Occupied</div>
+            <div className="text-3xl font-black text-pink-600">{stats.occupied}</div>
+          </div>
+          <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-sm">
+            <div className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Preparing</div>
+            <div className="text-3xl font-black text-orange-500">{stats.preparing}</div>
+          </div>
+          <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-sm">
+            <div className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-1">Ready</div>
+            <div className="text-3xl font-black text-emerald-500 animate-pulse">{stats.ready}</div>
+          </div>
+        </div>
+
+        {/* Tables Grid */}
+        <div className="mb-8">
+          <h2 className="text-lg font-black text-gray-900 mb-6 flex items-center gap-2">
+            <Table className="w-5 h-5 text-emerald-600" /> Dining Tables
+          </h2>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+            {tables.map((table) => (
+              <button
+                key={table.id}
+                onClick={() => navigate(`/admin/pos?tableId=${table.id}`)}
+                className={cn(
+                  "aspect-square rounded-[2.5rem] p-6 flex flex-col items-center justify-center gap-2 transition-all shadow-lg active:scale-95",
+                  table.is_active ? "bg-white border border-gray-100 hover:border-emerald-500 text-gray-900" : "bg-pink-50 border border-pink-100 text-pink-600"
+                )}
+              >
+                <div className={cn(
+                  "w-12 h-12 rounded-2xl flex items-center justify-center mb-2",
+                  table.is_active ? "bg-emerald-50 text-emerald-600" : "bg-pink-100 text-pink-600"
+                )}>
+                  <Table className="w-6 h-6" />
+                </div>
+                <div className="font-black text-lg">{table.name}</div>
+                <div className="text-[10px] font-black uppercase tracking-widest opacity-60">
+                  {table.capacity} Seats
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Quick Actions */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <button 
+            onClick={() => navigate('/admin/pos')}
+            className="bg-emerald-600 text-white p-8 rounded-[3rem] flex items-center justify-between shadow-xl shadow-emerald-500/20 hover:bg-emerald-700 transition-all group"
+          >
+            <div className="text-left">
+              <div className="text-2xl font-black mb-1">New Order</div>
+              <div className="text-emerald-100 text-sm font-medium">Create a quick takeaway order</div>
+            </div>
+            <div className="w-16 h-16 bg-white/20 rounded-[1.5rem] flex items-center justify-center group-hover:scale-110 transition-transform">
+              <Plus className="w-8 h-8" />
+            </div>
+          </button>
+          <button 
+            onClick={() => navigate('/admin/orders')}
+            className="bg-white text-gray-900 p-8 rounded-[3rem] border border-gray-100 flex items-center justify-between shadow-xl shadow-gray-200/20 hover:bg-gray-50 transition-all group"
+          >
+            <div className="text-left">
+              <div className="text-2xl font-black mb-1">Order History</div>
+              <div className="text-gray-400 text-sm font-medium">View all your served orders</div>
+            </div>
+            <div className="w-16 h-16 bg-gray-100 rounded-[1.5rem] flex items-center justify-center group-hover:scale-110 transition-transform">
+              <FileText className="w-8 h-8 text-gray-400" />
+            </div>
+          </button>
+        </div>
+      </div>
+
+      {/* Mobile Bottom Nav */}
+      <div className="lg:hidden fixed bottom-6 left-6 right-6 bg-white/80 backdrop-blur-xl border border-white/20 rounded-[2.5rem] shadow-2xl p-4 flex items-center justify-around z-40">
+        <button onClick={() => navigate('/waiter')} className="p-4 text-emerald-600 bg-emerald-50 rounded-2xl">
+          <Home className="w-6 h-6" />
+        </button>
+        <button onClick={() => navigate('/admin/pos')} className="p-4 text-gray-400 hover:text-emerald-600 transition-colors">
+          <PlusCircle className="w-6 h-6" />
+        </button>
+        <button onClick={() => navigate('/admin/orders')} className="p-4 text-gray-400 hover:text-emerald-600 transition-colors">
+          <ClipboardList className="w-6 h-6" />
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const BranchDashboard = () => {
+  const { branchUser, logout } = useAuthStore();
+  const navigate = useNavigate();
+
+  if (!branchUser) {
+    navigate('/login');
+    return null;
+  }
+
+  return (
+    <AdminLayout title={`Branch: ${branchUser.name}`}>
+      <div className="space-y-8">
+        <div className="bg-emerald-600 rounded-[2.5rem] p-8 lg:p-12 text-white relative overflow-hidden">
+          <div className="relative z-10">
+            <h2 className="text-3xl lg:text-4xl font-black mb-2">Welcome, {branchUser.name}!</h2>
+            <p className="text-emerald-100 font-bold">Manage your branch orders and settings here.</p>
+          </div>
+          <MapPin className="absolute -right-10 -bottom-10 w-64 h-64 text-white/10 rotate-12" />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <Link to="/admin/pos" className="p-8 bg-white rounded-[2rem] border border-gray-100 shadow-sm hover:shadow-xl transition-all group">
+            <div className="w-14 h-14 bg-pink-100 rounded-2xl flex items-center justify-center text-pink-600 mb-6 group-hover:scale-110 transition-transform">
+              <ShoppingBag className="w-7 h-7" />
+            </div>
+            <h3 className="text-xl font-black text-gray-900 mb-2">Open POS</h3>
+            <p className="text-gray-400 text-sm font-medium">Take new orders for your branch</p>
+          </Link>
+          <Link to="/admin/orders?type=pos" className="p-8 bg-white rounded-[2rem] border border-gray-100 shadow-sm hover:shadow-xl transition-all group">
+            <div className="w-14 h-14 bg-blue-100 rounded-2xl flex items-center justify-center text-blue-600 mb-6 group-hover:scale-110 transition-transform">
+              <FileText className="w-7 h-7" />
+            </div>
+            <h3 className="text-xl font-black text-gray-900 mb-2">Branch Orders</h3>
+            <p className="text-gray-400 text-sm font-medium">View and manage all branch orders</p>
+          </Link>
+          <Link to="/admin/kitchens" className="p-8 bg-white rounded-[2rem] border border-gray-100 shadow-sm hover:shadow-xl transition-all group">
+            <div className="w-14 h-14 bg-emerald-100 rounded-2xl flex items-center justify-center text-emerald-600 mb-6 group-hover:scale-110 transition-transform">
+              <Utensils className="w-7 h-7" />
+            </div>
+            <h3 className="text-xl font-black text-gray-900 mb-2">Kitchen Status</h3>
+            <p className="text-gray-400 text-sm font-medium">Monitor your branch kitchen sections</p>
+          </Link>
+        </div>
+      </div>
     </AdminLayout>
   );
 };
@@ -5128,7 +6259,14 @@ export default function App() {
             <Route path="/admin/kitchens" element={<AdminRoute><AdminKitchens /></AdminRoute>} />
             <Route path="/admin/items" element={<AdminRoute><AdminItems /></AdminRoute>} />
             <Route path="/admin/users" element={<AdminRoute><AdminUsers /></AdminRoute>} />
+            <Route path="/admin/waiters" element={<AdminRoute><AdminWaiters /></AdminRoute>} />
+            <Route path="/admin/kitchen-staff" element={<AdminRoute><AdminKitchenStaff /></AdminRoute>} />
             <Route path="/admin/settings" element={<AdminRoute><AdminSettings /></AdminRoute>} />
+            
+            {/* Branch & Waiter Panels */}
+            <Route path="/branch" element={<BranchDashboard />} />
+            <Route path="/waiter" element={<WaiterDashboard />} />
+            <Route path="/kitchen" element={<KitchenDashboard />} />
             {/* Add more routes as needed */}
           </Routes>
         </main>

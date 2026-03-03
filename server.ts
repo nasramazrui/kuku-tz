@@ -128,6 +128,32 @@ db.exec(`
     qr_code TEXT,
     FOREIGN KEY (branch_id) REFERENCES branches(id)
   );
+
+  CREATE TABLE IF NOT EXISTS waiters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_id INTEGER,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE,
+    phone TEXT UNIQUE,
+    password TEXT NOT NULL,
+    is_active BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (branch_id) REFERENCES branches(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS kitchen_staff (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_id INTEGER,
+    kitchen_id INTEGER,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE,
+    phone TEXT UNIQUE,
+    password TEXT NOT NULL,
+    is_active BOOLEAN DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (branch_id) REFERENCES branches(id),
+    FOREIGN KEY (kitchen_id) REFERENCES kitchens(id)
+  );
 `);
 
 console.log("Database initialized.");
@@ -141,6 +167,10 @@ const migrations = [
   "ALTER TABLE addresses ADD COLUMN latitude REAL",
   "ALTER TABLE addresses ADD COLUMN longitude REAL",
   "ALTER TABLE orders ADD COLUMN table_id INTEGER REFERENCES dining_tables(id)",
+  "ALTER TABLE orders ADD COLUMN waiter_id INTEGER REFERENCES waiters(id)",
+  "ALTER TABLE orders ADD COLUMN notes TEXT",
+  "ALTER TABLE order_items ADD COLUMN status TEXT DEFAULT 'pending'",
+  "ALTER TABLE order_items ADD COLUMN notes TEXT",
   "ALTER TABLE users ADD COLUMN email TEXT UNIQUE",
   "ALTER TABLE users ADD COLUMN phone TEXT UNIQUE",
   "ALTER TABLE users ADD COLUMN whatsapp TEXT",
@@ -346,6 +376,52 @@ async function startServer() {
     }
   });
 
+  // Branch & Waiter Auth
+  app.post("/api/auth/branch/login", (req, res) => {
+    const { identifier, password } = req.body;
+    const branch = db.prepare("SELECT * FROM branches WHERE (email = ? OR name = ?) AND password = ?")
+      .get(identifier, identifier, password);
+    
+    if (branch) {
+      res.json({ success: true, type: 'branch', data: branch });
+    } else {
+      res.status(401).json({ error: "Invalid credentials" });
+    }
+  });
+
+  app.post("/api/auth/waiter/login", (req, res) => {
+    const { identifier, password } = req.body;
+    const waiter = db.prepare(`
+      SELECT w.*, b.name as branch_name 
+      FROM waiters w 
+      JOIN branches b ON w.branch_id = b.id 
+      WHERE (w.email = ? OR w.phone = ? OR w.name = ?) AND w.password = ? AND w.is_active = 1
+    `).get(identifier, identifier, identifier, password);
+    
+    if (waiter) {
+      res.json({ success: true, type: 'waiter', data: waiter });
+    } else {
+      res.status(401).json({ error: "Invalid credentials" });
+    }
+  });
+
+  app.post("/api/auth/kitchen/login", (req, res) => {
+    const { identifier, password } = req.body;
+    const staff = db.prepare(`
+      SELECT ks.*, b.name as branch_name, k.name as kitchen_name 
+      FROM kitchen_staff ks 
+      JOIN branches b ON ks.branch_id = b.id 
+      JOIN kitchens k ON ks.kitchen_id = k.id
+      WHERE (ks.email = ? OR ks.phone = ? OR ks.name = ?) AND ks.password = ? AND ks.is_active = 1
+    `).get(identifier, identifier, identifier, password);
+    
+    if (staff) {
+      res.json({ success: true, type: 'kitchen', data: staff });
+    } else {
+      res.status(401).json({ error: "Invalid credentials" });
+    }
+  });
+
   app.get("/api/user/profile/:uid", (req, res) => {
     const user = db.prepare("SELECT * FROM users WHERE uid = ?").get(req.params.uid);
     if (user) {
@@ -424,6 +500,8 @@ async function startServer() {
       transaction_id,
       address,
       table_id,
+      waiter_id,
+      notes,
       items 
     } = req.body;
     
@@ -452,30 +530,33 @@ async function startServer() {
         INSERT INTO orders (
           customer_name, customer_phone, customer_uid, branch_id, total_amount, 
           subtotal, discount, vat, order_type, payment_method, 
-          received_amount, change_amount, transaction_id, address, token_no, table_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          received_amount, change_amount, transaction_id, address, token_no, table_id, waiter_id, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         customer_name, customer_phone, customer_uid, branch_id, total_amount,
         subtotal || total_amount, discount || 0, vat || 0, order_type, payment_method || 'cash',
-        received_amount || 0, change_amount || 0, transaction_id || null, address || null, token_no, table_id || null
+        received_amount || 0, change_amount || 0, transaction_id || null, address || null, token_no, table_id || null, waiter_id || null, notes || null
       );
       
       const orderId = info.lastInsertRowid;
       
       const insertItem = db.prepare(`
-        INSERT INTO order_items (order_id, item_id, quantity, price, variations)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO order_items (order_id, item_id, quantity, price, variations, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
       `);
       
       for (const item of items) {
         // Double check item exists to avoid FK error
         const itemExists = db.prepare("SELECT id FROM items WHERE id = ?").get(item.id);
         if (itemExists) {
-          insertItem.run(orderId, item.id, item.quantity, item.price, JSON.stringify(item.selectedOptions || item.variations || {}));
+          insertItem.run(orderId, item.id, item.quantity, item.price, JSON.stringify(item.selectedOptions || item.variations || {}), item.notes || null);
         } else {
           console.warn(`Item ID ${item.id} not found, skipping from order.`);
         }
       }
+
+      // Broadcast new order
+      broadcast({ type: 'new_order', branch_id, orderId });
       
       res.json({ success: true, orderId, token_no });
     } catch (error: any) {
@@ -717,6 +798,109 @@ async function startServer() {
     res.json(branches);
   });
 
+  // Kitchen Staff API
+  app.get("/api/admin/kitchen-staff", (req, res) => {
+    const branchId = req.query.branchId;
+    const where = branchId ? "WHERE ks.branch_id = ?" : "";
+    const params = branchId ? [branchId] : [];
+    const staff = db.prepare(`
+      SELECT ks.*, b.name as branch_name, k.name as kitchen_name 
+      FROM kitchen_staff ks 
+      LEFT JOIN branches b ON ks.branch_id = b.id
+      LEFT JOIN kitchens k ON ks.kitchen_id = k.id
+      ${where}
+    `).all(...params);
+    res.json(staff);
+  });
+
+  app.post("/api/admin/kitchen-staff", (req, res) => {
+    const { branch_id, kitchen_id, name, email, phone, password, is_active } = req.body;
+    const info = db.prepare("INSERT INTO kitchen_staff (branch_id, kitchen_id, name, email, phone, password, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(branch_id, kitchen_id, name, email, phone, password, is_active ? 1 : 0);
+    res.json({ success: true, id: info.lastInsertRowid });
+  });
+
+  app.put("/api/admin/kitchen-staff/:id", (req, res) => {
+    const { branch_id, kitchen_id, name, email, phone, password, is_active } = req.body;
+    db.prepare("UPDATE kitchen_staff SET branch_id = ?, kitchen_id = ?, name = ?, email = ?, phone = ?, password = ?, is_active = ? WHERE id = ?")
+      .run(branch_id, kitchen_id, name, email, phone, password, is_active ? 1 : 0, req.params.id);
+    res.json({ success: true });
+  });
+
+  app.delete("/api/admin/kitchen-staff/:id", (req, res) => {
+    db.prepare("DELETE FROM kitchen_staff WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
+  // Kitchen Panel API
+  app.get("/api/kitchen/orders", (req, res) => {
+    const { branchId, kitchenId } = req.query;
+    if (!branchId || !kitchenId) return res.status(400).json({ error: "Missing branchId or kitchenId" });
+
+    const orders = db.prepare(`
+      SELECT o.id as order_id, o.token_no, o.order_type, o.created_at, o.notes as order_notes,
+             dt.name as table_name,
+             oi.id as item_id, oi.quantity, oi.status as item_status, oi.notes as item_notes, oi.variations,
+             i.name as item_name
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      JOIN items i ON oi.item_id = i.id
+      LEFT JOIN dining_tables dt ON o.table_id = dt.id
+      WHERE o.branch_id = ? AND i.kitchen_id = ? AND o.status != 'completed' AND o.status != 'cancelled'
+      ORDER BY o.created_at ASC
+    `).all(branchId, kitchenId);
+
+    // Group by order
+    const groupedOrders: any[] = [];
+    orders.forEach((row: any) => {
+      let order = groupedOrders.find(o => o.order_id === row.order_id);
+      if (!order) {
+        order = {
+          order_id: row.order_id,
+          token_no: row.token_no,
+          order_type: row.order_type,
+          created_at: row.created_at,
+          order_notes: row.order_notes,
+          table_name: row.table_name,
+          items: []
+        };
+        groupedOrders.push(order);
+      }
+      order.items.push({
+        item_id: row.item_id,
+        item_name: row.item_name,
+        quantity: row.quantity,
+        status: row.item_status,
+        notes: row.item_notes,
+        variations: JSON.parse(row.variations || '{}')
+      });
+    });
+
+    res.json(groupedOrders);
+  });
+
+  app.patch("/api/kitchen/order-items/:id/status", (req, res) => {
+    const { status } = req.body;
+    db.prepare("UPDATE order_items SET status = ? WHERE id = ?").run(status, req.params.id);
+    
+    // Check if all items in the order are ready/completed to update order status
+    const item = db.prepare("SELECT order_id FROM order_items WHERE id = ?").get(req.params.id) as { order_id: number };
+    const allItems = db.prepare("SELECT status FROM order_items WHERE order_id = ?").all(item.order_id) as { status: string }[];
+    
+    let newOrderStatus = 'preparing';
+    if (allItems.every(i => i.status === 'ready')) {
+      newOrderStatus = 'ready';
+    } else if (allItems.some(i => i.status === 'preparing')) {
+      newOrderStatus = 'preparing';
+    }
+
+    db.prepare("UPDATE orders SET status = ? WHERE id = ?").run(newOrderStatus, item.order_id);
+    
+    broadcast({ type: 'order_status_update', orderId: item.order_id, status: newOrderStatus });
+    
+    res.json({ success: true });
+  });
+
   app.post("/api/admin/branches", (req, res) => {
     const { name, address, email, password, latitude, longitude, is_active } = req.body;
     const info = db.prepare("INSERT INTO branches (name, address, email, password, latitude, longitude, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)").run(name, address, email, password, latitude, longitude, is_active ? 1 : 0);
@@ -795,6 +979,40 @@ app.delete("/api/admin/kitchens/:id", (req, res) => {
       res.status(500).json({ error: error.message });
     }
   }
+});
+
+// Admin Waiters
+app.get("/api/admin/waiters", (req, res) => {
+  const waiters = db.prepare(`
+    SELECT w.*, b.name as branch_name 
+    FROM waiters w 
+    LEFT JOIN branches b ON w.branch_id = b.id
+    ORDER BY w.created_at DESC
+  `).all();
+  res.json(waiters);
+});
+
+app.post("/api/admin/waiters", (req, res) => {
+  const { name, branch_id, email, phone, password, is_active } = req.body;
+  try {
+    const info = db.prepare("INSERT INTO waiters (name, branch_id, email, phone, password, is_active) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(name, branch_id, email, phone, password, is_active ? 1 : 0);
+    res.json({ success: true, id: info.lastInsertRowid });
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.put("/api/admin/waiters/:id", (req, res) => {
+  const { name, branch_id, email, phone, password, is_active } = req.body;
+  db.prepare("UPDATE waiters SET name = ?, branch_id = ?, email = ?, phone = ?, password = ?, is_active = ? WHERE id = ?")
+    .run(name, branch_id, email, phone, password, is_active ? 1 : 0, req.params.id);
+  res.json({ success: true });
+});
+
+app.delete("/api/admin/waiters/:id", (req, res) => {
+  db.prepare("DELETE FROM waiters WHERE id = ?").run(req.params.id);
+  res.json({ success: true });
 });
 
 // Vite middleware for development
