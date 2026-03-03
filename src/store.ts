@@ -51,23 +51,30 @@ export const useCartStore = create<CartState>()(
 
 interface AuthState {
   user: FirebaseUser | null;
+  branchUser: any | null;
   loading: boolean;
   setUser: (user: FirebaseUser | null) => void;
+  setBranchUser: (branch: any | null) => void;
   setLoading: (loading: boolean) => void;
   logout: () => void;
 }
 
 export const useAuthStore = create<AuthState>()(
-  (set) => ({
-    user: null,
-    loading: true,
-    setUser: (user) => set({ user, loading: false }),
-    setLoading: (loading) => set({ loading }),
-    logout: () => {
-      auth.signOut();
-      set({ user: null });
-    },
-  })
+  persist(
+    (set) => ({
+      user: null,
+      branchUser: null,
+      loading: true,
+      setUser: (user) => set({ user, loading: false }),
+      setBranchUser: (branchUser) => set({ branchUser, loading: false }),
+      setLoading: (loading) => set({ loading }),
+      logout: () => {
+        auth.signOut();
+        set({ user: null, branchUser: null });
+      },
+    }),
+    { name: 'auth-storage' }
+  )
 );
 
 // Initialize auth listener

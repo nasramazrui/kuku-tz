@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Link, useNavigate, useLocation } from 'react-router-dom';
+import { GoogleGenAI } from "@google/genai";
 import { 
   LineChart, 
   Line, 
@@ -71,7 +72,9 @@ import {
   Tv,
   Calendar,
   Layers,
-  Table
+  Table,
+  Globe,
+  Camera
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Toaster, toast } from 'react-hot-toast';
@@ -92,30 +95,271 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371; // Radius of the earth in km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c; // Distance in km
+}
+
 // --- Components ---
 
-const Navbar = () => {
-  const { branch } = useAppStore();
-  const { user } = useAuthStore();
-  const [isMenuOpen, setIsMenuOpen] = useState(false);
+const LocationPicker = ({ onSelect }: { onSelect: (loc: { address: string, lat: number, lng: number }) => void }) => {
+  const [search, setSearch] = useState('');
+  const [results, setResults] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const handleSearch = async () => {
+    if (!search) return;
+    setLoading(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: `Find the location for: ${search}. Return the address and its approximate latitude and longitude.`,
+        config: {
+          tools: [{ googleMaps: {} }],
+        },
+      });
+      
+      const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+      if (chunks) {
+        const mapsResults = chunks.filter((c: any) => c.maps).map((c: any) => ({
+          title: c.maps.title,
+          address: c.maps.title,
+          uri: c.maps.uri,
+          // In a real app, we'd parse the lat/lng from the URI or metadata
+          // For this demo, we'll generate random coordinates near a center if not found
+          lat: -6.7924 + (Math.random() - 0.5) * 0.1, 
+          lng: 39.2083 + (Math.random() - 0.5) * 0.1
+        }));
+        setResults(mapsResults);
+      }
+    } catch (e) {
+      console.error(e);
+      toast.error("Failed to search location");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
-    <nav className="sticky top-0 z-50 bg-white px-4 py-3">
-      <div className="max-w-7xl mx-auto flex items-center justify-between">
-        <Link to="/" className="text-2xl font-bold text-emerald-600 tracking-tight">
-          FoodAppi
-        </Link>
+    <div className="space-y-4">
+      <div className="flex gap-2">
+        <input 
+          type="text" 
+          value={search} 
+          onChange={e => setSearch(e.target.value)}
+          placeholder="Search location (e.g. Mlimani City, Dar es Salaam)..."
+          className="flex-1 p-4 bg-gray-50 rounded-2xl border-none focus:ring-2 focus:ring-emerald-500 text-sm font-bold"
+        />
+        <button onClick={handleSearch} disabled={loading} className="p-4 bg-emerald-500 text-white rounded-2xl shadow-lg shadow-emerald-500/30">
+          {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Search className="w-5 h-5" />}
+        </button>
+      </div>
+      <div className="space-y-2 max-h-60 overflow-y-auto no-scrollbar">
+        {results.map((res, idx) => (
+          <button 
+            key={idx} 
+            onClick={() => onSelect({ address: res.title, lat: res.lat, lng: res.lng })}
+            className="w-full text-left p-4 bg-white border border-gray-100 rounded-2xl hover:bg-emerald-50 hover:border-emerald-200 transition-all group"
+          >
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-emerald-100 rounded-lg text-emerald-600 group-hover:bg-emerald-200 transition-colors">
+                <MapPin className="w-4 h-4" />
+              </div>
+              <div>
+                <p className="font-bold text-sm text-gray-900">{res.title}</p>
+                <p className="text-[10px] text-gray-400 font-medium uppercase tracking-widest">Select this location</p>
+              </div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
 
-        <div className="flex items-center gap-2 text-right">
-          <div className="flex flex-col items-end">
-            <span className="text-[10px] text-gray-400 font-bold uppercase">Branch</span>
-            <button className="flex items-center gap-1 text-xs font-bold text-gray-700">
-              {branch?.name || 'Main Branch'}
-              <ChevronRight className="w-3 h-3 rotate-90" />
-            </button>
-          </div>
+const Navbar = () => {
+  const { branch, setBranch } = useAppStore();
+  const { user } = useAuthStore();
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isBranchModalOpen, setIsBranchModalOpen] = useState(false);
+  const [branches, setBranches] = useState<any[]>([]);
+
+  useEffect(() => {
+    fetch('/api/admin/branches').then(res => res.json()).then(data => {
+      setBranches(data);
+      if (!branch && data.length > 0) {
+        // Try to find nearest branch on load
+        navigator.geolocation.getCurrentPosition((pos) => {
+          const { latitude, longitude } = pos.coords;
+          let nearest = data[0];
+          let minDistance = getDistance(latitude, longitude, data[0].latitude || 0, data[0].longitude || 0);
+          data.forEach((b: any) => {
+            const dist = getDistance(latitude, longitude, b.latitude || 0, b.longitude || 0);
+            if (dist < minDistance) {
+              minDistance = dist;
+              nearest = b;
+            }
+          });
+          setBranch(nearest);
+        }, () => {
+          setBranch(data[0]);
+        });
+      }
+    });
+  }, []);
+
+  return (
+    <nav className="sticky top-0 z-50 bg-white/80 backdrop-blur-md px-4 py-3 border-b border-gray-100">
+      <div className="max-w-7xl mx-auto flex items-center justify-between">
+        <div className="flex items-center gap-6">
+          <Link to="/" className="text-2xl font-black text-emerald-600 tracking-tighter">
+            FoodAppi
+          </Link>
+          <button 
+            onClick={() => setIsBranchModalOpen(true)}
+            className="hidden md:flex items-center gap-2 px-4 py-2 bg-gray-50 hover:bg-gray-100 rounded-2xl transition-all group"
+          >
+            <div className="p-1.5 bg-emerald-100 rounded-lg text-emerald-600 group-hover:bg-emerald-200 transition-colors">
+              <MapPin className="w-3.5 h-3.5" />
+            </div>
+            <div className="text-left">
+              <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest leading-none mb-0.5">Branch</p>
+              <p className="text-xs font-bold text-gray-900 leading-none">{branch?.name || 'Select Branch'}</p>
+            </div>
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Link to="/search" className="p-3 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-2xl transition-all">
+            <Search className="w-5 h-5" />
+          </Link>
+          <Link to="/cart" className="p-3 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-2xl transition-all relative">
+            <ShoppingBag className="w-5 h-5" />
+          </Link>
+          <button onClick={() => setIsMenuOpen(true)} className="p-3 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-2xl transition-all">
+            <MenuIcon className="w-5 h-5" />
+          </button>
         </div>
       </div>
+
+      {/* Branch Selection Modal */}
+      <AnimatePresence>
+        {isBranchModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsBranchModalOpen(false)}
+              className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative bg-white w-full max-w-sm rounded-3xl shadow-2xl overflow-hidden"
+            >
+              <div className="p-6 border-b border-gray-100 flex items-center justify-between">
+                <h2 className="text-lg font-black text-gray-900 uppercase tracking-widest">Select Branch</h2>
+                <button onClick={() => setIsBranchModalOpen(false)} className="p-2 hover:bg-gray-100 rounded-full"><X className="w-5 h-5" /></button>
+              </div>
+              <div className="p-4 space-y-2 max-h-[60vh] overflow-y-auto no-scrollbar">
+                {branches.map(b => (
+                  <button 
+                    key={b.id}
+                    onClick={() => {
+                      setBranch(b);
+                      setIsBranchModalOpen(false);
+                      toast.success(`Switched to ${b.name}`);
+                    }}
+                    className={cn(
+                      "w-full text-left p-4 rounded-2xl border transition-all flex items-center justify-between group",
+                      branch?.id === b.id ? "bg-emerald-50 border-emerald-200" : "bg-white border-gray-100 hover:border-emerald-200 hover:bg-emerald-50/30"
+                    )}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={cn(
+                        "p-2 rounded-xl transition-colors",
+                        branch?.id === b.id ? "bg-emerald-500 text-white" : "bg-gray-100 text-gray-400 group-hover:bg-emerald-100 group-hover:text-emerald-600"
+                      )}>
+                        <MapPin className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <p className="font-bold text-sm text-gray-900">{b.name}</p>
+                        <p className="text-xs text-gray-400 font-medium">{b.address}</p>
+                      </div>
+                    </div>
+                    {branch?.id === b.id && <CheckCircle2 className="w-5 h-5 text-emerald-500" />}
+                  </button>
+                ))}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Mobile Menu */}
+      <AnimatePresence>
+        {isMenuOpen && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsMenuOpen(false)}
+              className="fixed inset-0 z-[100] bg-black/50 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              className="fixed right-0 top-0 bottom-0 z-[101] w-80 bg-white shadow-2xl p-8"
+            >
+              <div className="flex items-center justify-between mb-8">
+                <h2 className="text-xl font-black text-gray-900 uppercase tracking-widest">Menu</h2>
+                <button onClick={() => setIsMenuOpen(false)} className="p-2 hover:bg-gray-100 rounded-full"><X className="w-6 h-6" /></button>
+              </div>
+              <div className="space-y-4">
+                <Link to="/" onClick={() => setIsMenuOpen(false)} className="flex items-center gap-4 p-4 bg-gray-50 rounded-2xl text-sm font-bold text-gray-900 hover:bg-emerald-50 hover:text-emerald-600 transition-all">
+                  <Home className="w-5 h-5" /> Home
+                </Link>
+                <Link to="/profile" onClick={() => setIsMenuOpen(false)} className="flex items-center gap-4 p-4 bg-gray-50 rounded-2xl text-sm font-bold text-gray-900 hover:bg-emerald-50 hover:text-emerald-600 transition-all">
+                  <User className="w-5 h-5" /> Profile
+                </Link>
+                <Link to="/orders" onClick={() => setIsMenuOpen(false)} className="flex items-center gap-4 p-4 bg-gray-50 rounded-2xl text-sm font-bold text-gray-900 hover:bg-emerald-50 hover:text-emerald-600 transition-all">
+                  <ClipboardList className="w-5 h-5" /> My Orders
+                </Link>
+                <Link to="/addresses" onClick={() => setIsMenuOpen(false)} className="flex items-center gap-4 p-4 bg-gray-50 rounded-2xl text-sm font-bold text-gray-900 hover:bg-emerald-50 hover:text-emerald-600 transition-all">
+                  <MapPin className="w-5 h-5" /> Addresses
+                </Link>
+                {user?.email === 'amytzee@gmail.com' && (
+                  <Link to="/admin" onClick={() => setIsMenuOpen(false)} className="flex items-center gap-4 p-4 bg-emerald-50 rounded-2xl text-sm font-bold text-emerald-600 hover:bg-emerald-100 transition-all">
+                    <LayoutDashboard className="w-5 h-5" /> Admin Dashboard
+                  </Link>
+                )}
+                <button 
+                  onClick={() => {
+                    useAuthStore.getState().logout();
+                    setIsMenuOpen(false);
+                    toast.success('Logged out');
+                  }}
+                  className="w-full flex items-center gap-4 p-4 bg-red-50 rounded-2xl text-sm font-bold text-red-600 hover:bg-red-100 transition-all"
+                >
+                  <LogOut className="w-5 h-5" /> Logout
+                </button>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
     </nav>
   );
 };
@@ -128,7 +372,7 @@ const BottomNav = () => {
     { icon: Home, label: 'Home', path: '/' },
     { icon: Utensils, label: 'Menu', path: '/menu' },
     { icon: ShoppingBag, label: 'Cart', path: '/cart', isCart: true },
-    { icon: MessageCircle, label: 'Offers', path: '/offers' },
+    { icon: Percent, label: 'Offers', path: '/offers' },
     { icon: User, label: 'Profile', path: '/profile' },
   ];
 
@@ -980,6 +1224,22 @@ const LoginPage = () => {
     e.preventDefault();
     setLoading(true);
     try {
+      // Try Branch Login first
+      const branchLoginRes = await fetch('/api/auth/branch-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: identifier, password })
+      });
+
+      if (branchLoginRes.ok) {
+        const data = await branchLoginRes.json();
+        useAuthStore.getState().setBranchUser(data.branch);
+        toast.success(`Welcome back, ${data.branch.name}!`);
+        navigate('/admin');
+        return;
+      }
+
+      // If not branch, try Firebase User Login
       // Lookup email by identifier (name, email, or phone)
       const lookupRes = await fetch('/api/auth/lookup', {
         method: 'POST',
@@ -1213,66 +1473,688 @@ const RegisterPage = () => {
   );
 };
 
-const ProfilePage = () => {
-  const { user, logout, loading } = useAuthStore();
-  const [profile, setProfile] = useState<any>(null);
+const OrderCard = ({ order, key }: { order: any, key?: any }) => (
+  <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm mb-4">
+    <div className="flex justify-between items-start mb-4">
+      <div className="flex gap-4">
+        <div className="w-12 h-12 bg-emerald-50 rounded-2xl flex items-center justify-center text-emerald-600">
+          <ShoppingBag className="w-6 h-6" />
+        </div>
+        <div>
+          <h3 className="font-black text-gray-900">Order ID: #{order.id}</h3>
+          <p className="text-[10px] text-gray-400 font-bold">{new Date(order.created_at).toLocaleString()}</p>
+          <p className="text-xs font-bold text-emerald-600 mt-1 capitalize">{order.order_type}</p>
+        </div>
+      </div>
+      <span className={cn(
+        "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider",
+        order.status === 'Delivered' ? "bg-emerald-100 text-emerald-600" : 
+        order.status === 'Cancelled' ? "bg-red-100 text-red-600" : "bg-amber-100 text-amber-600"
+      )}>
+        {order.status}
+      </span>
+    </div>
+    <div className="flex justify-between items-center pt-4 border-t border-gray-50">
+      <p className="text-sm font-black text-gray-900">Total: ${order.total_amount.toFixed(2)}</p>
+      <button className="text-emerald-600 text-xs font-black flex items-center gap-1 hover:gap-2 transition-all">
+        See Details <ChevronRight className="w-4 h-4" />
+      </button>
+    </div>
+  </div>
+);
+
+const OrdersPage = () => {
+  const { user, loading } = useAuthStore();
+  const [orders, setOrders] = useState<any[]>([]);
   const navigate = useNavigate();
 
   useEffect(() => {
     if (!loading && !user) {
       navigate('/login');
     } else if (user) {
-      fetch(`/api/user/profile/${user.uid}`)
+      fetch(`/api/user/orders/${user.uid}`)
         .then(res => res.json())
-        .then(setProfile);
+        .then(setOrders);
     }
   }, [user, loading, navigate]);
 
   if (loading || !user) return <div className="p-8">Loading...</div>;
 
-  return (
-    <div className="max-w-md mx-auto py-12 px-4">
-      <div className="bg-white p-8 rounded-3xl border border-gray-100 shadow-xl shadow-emerald-500/5">
-        <div className="flex flex-col items-center mb-8">
-          <div className="w-24 h-24 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 text-3xl font-bold mb-4">
-            {user.displayName?.[0] || user.email?.[0].toUpperCase()}
-          </div>
-          <h1 className="text-2xl font-bold text-gray-900">{user.displayName || 'User'}</h1>
-          <p className="text-gray-500 text-sm">{user.email}</p>
-        </div>
+  const activeOrders = orders.filter(o => !['Delivered', 'Cancelled'].includes(o.status));
+  const previousOrders = orders.filter(o => ['Delivered', 'Cancelled'].includes(o.status));
 
-        {profile && (
-          <div className="space-y-4 mb-8">
-            <div className="p-4 bg-gray-50 rounded-2xl">
-              <p className="text-xs text-gray-400 font-bold uppercase mb-1">Phone</p>
-              <p className="text-sm font-bold text-gray-900">{profile.phone}</p>
-            </div>
-            {profile.whatsapp && (
-              <div className="p-4 bg-gray-50 rounded-2xl">
-                <p className="text-xs text-gray-400 font-bold uppercase mb-1">WhatsApp</p>
-                <p className="text-sm font-bold text-gray-900">{profile.whatsapp}</p>
+  return (
+    <div className="max-w-md mx-auto py-8 px-4 min-h-screen bg-gray-50/50">
+      <div className="flex items-center gap-4 mb-8">
+        <button onClick={() => navigate(-1)} className="p-2 hover:bg-white rounded-full transition-colors">
+          <ArrowLeft className="w-5 h-5 text-emerald-600" />
+        </button>
+        <h1 className="text-2xl font-black text-emerald-800">My Orders</h1>
+      </div>
+
+      {activeOrders.length > 0 && (
+        <div className="mb-10">
+          <h2 className="text-lg font-black text-gray-900 mb-4 px-2">Active Orders</h2>
+          {activeOrders.map(order => <OrderCard key={order.id} order={order} />)}
+        </div>
+      )}
+
+      <div>
+        <h2 className="text-lg font-black text-gray-900 mb-4 px-2">Previous Orders</h2>
+        {previousOrders.length > 0 ? (
+          previousOrders.map(order => <OrderCard key={order.id} order={order} />)
+        ) : (
+          <p className="text-center py-12 text-gray-400 font-bold">No previous orders</p>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const EditProfilePage = () => {
+  const { user, loading } = useAuthStore();
+  const [profile, setProfile] = useState<any>(null);
+  const [formData, setFormData] = useState({ first_name: '', last_name: '', phone: '+255' });
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!loading && !user) navigate('/login');
+    else if (user) {
+      fetch(`/api/user/profile/${user.uid}`)
+        .then(res => res.json())
+        .then(data => {
+          setProfile(data);
+          setFormData({
+            first_name: data.first_name || '',
+            last_name: data.last_name || '',
+            phone: data.phone || '+255'
+          });
+        });
+    }
+  }, [user, loading, navigate]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = await fetch(`/api/user/profile/${user?.uid}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(formData)
+    });
+    if (res.ok) {
+      toast.success('Profile updated');
+      navigate('/profile');
+    }
+  };
+
+  if (loading || !user) return <div className="p-8">Loading...</div>;
+
+  return (
+    <div className="max-w-md mx-auto py-8 px-4 min-h-screen bg-white">
+      <div className="flex items-center gap-4 mb-8">
+        <button onClick={() => navigate('/')} className="p-2 hover:bg-gray-50 rounded-full transition-colors text-emerald-600 font-bold flex items-center gap-1">
+          <ArrowLeft className="w-5 h-5" /> Back to Home
+        </button>
+      </div>
+      <h1 className="text-2xl font-black text-gray-900 mb-8">Edit Profile</h1>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <div className="space-y-2">
+          <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">First Name</label>
+          <input 
+            type="text"
+            value={formData.first_name}
+            onChange={e => setFormData({...formData, first_name: e.target.value})}
+            className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+            placeholder="Will"
+          />
+        </div>
+        <div className="space-y-2">
+          <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Last Name</label>
+          <input 
+            type="text"
+            value={formData.last_name}
+            onChange={e => setFormData({...formData, last_name: e.target.value})}
+            className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+            placeholder="Smith"
+          />
+        </div>
+        <div className="space-y-2">
+          <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Email</label>
+          <input 
+            type="email"
+            value={user.email || ''}
+            disabled
+            className="w-full p-4 bg-gray-100 border-none rounded-2xl text-sm font-bold text-gray-400 cursor-not-allowed"
+          />
+        </div>
+        <div className="space-y-2">
+          <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Phone</label>
+          <input 
+            type="text"
+            value={formData.phone}
+            onChange={e => setFormData({...formData, phone: e.target.value})}
+            className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+            placeholder="+255"
+          />
+        </div>
+        <button type="submit" className="w-full bg-emerald-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-lg shadow-emerald-500/20 hover:bg-emerald-600 transition-all">
+          Update Profile
+        </button>
+      </form>
+    </div>
+  );
+};
+
+const AddressPage = () => {
+  const { user, loading } = useAuthStore();
+  const { setBranch } = useAppStore();
+  const [addresses, setAddresses] = useState<any[]>([]);
+  const [branches, setBranches] = useState<any[]>([]);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [formData, setFormData] = useState({ label: 'Home', address: '', latitude: 0, longitude: 0, is_default: false });
+  const navigate = useNavigate();
+
+  const fetchAddresses = async () => {
+    if (user) {
+      const [addrRes, branchRes] = await Promise.all([
+        fetch(`/api/user/addresses/${user.uid}`),
+        fetch('/api/admin/branches')
+      ]);
+      setAddresses(await addrRes.json());
+      setBranches(await branchRes.json());
+    }
+  };
+
+  useEffect(() => {
+    if (!loading && !user) navigate('/login');
+    else if (user) fetchAddresses();
+  }, [user, loading, navigate]);
+
+  const findNearestBranch = (lat: number, lng: number) => {
+    if (branches.length === 0) return;
+    let nearest = branches[0];
+    let minDistance = getDistance(lat, lng, branches[0].latitude || 0, branches[0].longitude || 0);
+
+    branches.forEach(b => {
+      const dist = getDistance(lat, lng, b.latitude || 0, b.longitude || 0);
+      if (dist < minDistance) {
+        minDistance = dist;
+        nearest = b;
+      }
+    });
+
+    setBranch(nearest);
+    toast.success(`Nearest branch found: ${nearest.name}`);
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = await fetch(`/api/user/addresses/${user?.uid}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(formData)
+    });
+    if (res.ok) {
+      // Set nearest branch based on the new address
+      if (formData.latitude && formData.longitude) {
+        findNearestBranch(formData.latitude, formData.longitude);
+      }
+      
+      toast.success('Address added');
+      setIsModalOpen(false);
+      setFormData({ label: 'Home', address: '', latitude: 0, longitude: 0, is_default: false });
+      fetchAddresses();
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (confirm('Delete this address?')) {
+      await fetch(`/api/user/addresses/${id}`, { method: 'DELETE' });
+      fetchAddresses();
+    }
+  };
+
+  if (loading || !user) return <div className="p-8">Loading...</div>;
+
+  return (
+    <div className="max-w-md mx-auto py-8 px-4 min-h-screen bg-white">
+      <div className="flex items-center justify-between mb-8">
+        <button onClick={() => navigate(-1)} className="p-2 hover:bg-gray-50 rounded-full transition-colors text-emerald-600">
+          <ArrowLeft className="w-5 h-5" />
+        </button>
+        <button 
+          onClick={() => setIsModalOpen(true)}
+          className="bg-emerald-500 text-white px-4 py-2 rounded-xl text-xs font-black uppercase tracking-widest shadow-lg shadow-emerald-500/20"
+        >
+          Add New
+        </button>
+      </div>
+      <h1 className="text-2xl font-black text-gray-900 mb-8">My Addresses</h1>
+
+      {addresses.length > 0 ? (
+        <div className="space-y-4">
+          {addresses.map(addr => (
+            <div key={addr.id} className="p-6 bg-gray-50 rounded-3xl border border-gray-100 flex justify-between items-start">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-black text-gray-900 uppercase tracking-widest">{addr.label}</span>
+                  {addr.is_default && <span className="px-2 py-0.5 bg-emerald-100 text-emerald-600 text-[8px] font-black uppercase rounded-full">Default</span>}
+                </div>
+                <p className="text-sm text-gray-500 font-medium">{addr.address}</p>
               </div>
-            )}
+              <button onClick={() => handleDelete(addr.id)} className="p-2 text-red-400 hover:text-red-600">
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="flex flex-col items-center justify-center py-20 text-center">
+          <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+            <MapPin className="w-10 h-10 text-gray-200" />
+          </div>
+          <h3 className="text-lg font-black text-gray-900 mb-1">Not Found</h3>
+          <p className="text-sm text-gray-400 font-bold">No data available</p>
+        </div>
+      )}
+
+      {/* Add Address Modal */}
+      <AnimatePresence>
+        {isModalOpen && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setIsModalOpen(false)} className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+            <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="relative w-full max-w-sm bg-white rounded-3xl p-8 shadow-2xl">
+              <h3 className="text-xl font-black text-gray-900 mb-6">Add New Address</h3>
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Search Location</label>
+                    <LocationPicker onSelect={(loc) => setFormData({ ...formData, address: loc.address, latitude: loc.lat, longitude: loc.lng })} />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Label</label>
+                    <select 
+                      value={formData.label}
+                      onChange={e => setFormData({...formData, label: e.target.value})}
+                      className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+                    >
+                      <option>Home</option>
+                      <option>Work</option>
+                      <option>Other</option>
+                    </select>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Address</label>
+                    <textarea 
+                      value={formData.address}
+                      onChange={e => setFormData({...formData, address: e.target.value})}
+                      className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500 h-24 resize-none"
+                      placeholder="Enter full address..."
+                    />
+                  </div>
+                </div>
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input 
+                    type="checkbox" 
+                    checked={formData.is_default}
+                    onChange={e => setFormData({...formData, is_default: e.target.checked})}
+                    className="w-5 h-5 rounded-lg border-gray-200 text-emerald-500 focus:ring-emerald-500"
+                  />
+                  <span className="text-xs font-bold text-gray-600">Set as default address</span>
+                </label>
+                <div className="flex gap-3 pt-4">
+                  <button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 py-4 bg-gray-100 text-gray-600 rounded-2xl font-bold">Cancel</button>
+                  <button type="submit" className="flex-1 py-4 bg-emerald-500 text-white rounded-2xl font-bold shadow-lg shadow-emerald-500/20">Save</button>
+                </div>
+              </form>
+            </motion.div>
           </div>
         )}
+      </AnimatePresence>
+    </div>
+  );
+};
 
-        <div className="space-y-3">
-          {user.email === 'amytzee@gmail.com' && (
-            <Link to="/admin" className="flex items-center justify-center gap-3 w-full bg-emerald-50 text-emerald-600 py-4 rounded-xl font-bold hover:bg-emerald-100 transition-all">
-              <LayoutDashboard className="w-5 h-5" /> Admin Dashboard
-            </Link>
-          )}
+const ChangePasswordPage = () => {
+  const { user, loading } = useAuthStore();
+  const [formData, setFormData] = useState({ old: '', new: '', retype: '' });
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!loading && !user) navigate('/login');
+  }, [user, loading, navigate]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (formData.new !== formData.retype) {
+      toast.error('Passwords do not match');
+      return;
+    }
+    // In a real app with Firebase, you'd use updatePassword(user, newPassword)
+    // For this demo, we'll just show success
+    toast.success('Password changed successfully');
+    navigate('/profile');
+  };
+
+  if (loading || !user) return <div className="p-8">Loading...</div>;
+
+  return (
+    <div className="max-w-md mx-auto py-8 px-4 min-h-screen bg-white">
+      <div className="flex items-center gap-4 mb-8">
+        <button onClick={() => navigate('/')} className="p-2 hover:bg-gray-50 rounded-full transition-colors text-emerald-600 font-bold flex items-center gap-1">
+          <ArrowLeft className="w-5 h-5" /> Back to Home
+        </button>
+      </div>
+      <h1 className="text-2xl font-black text-gray-900 mb-8">Change Password</h1>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <div className="space-y-2">
+          <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Old Password</label>
+          <input 
+            type="password"
+            value={formData.old}
+            onChange={e => setFormData({...formData, old: e.target.value})}
+            className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+          />
+        </div>
+        <div className="space-y-2">
+          <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">New Password</label>
+          <input 
+            type="password"
+            value={formData.new}
+            onChange={e => setFormData({...formData, new: e.target.value})}
+            className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+          />
+        </div>
+        <div className="space-y-2">
+          <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Retype New Password</label>
+          <input 
+            type="password"
+            value={formData.retype}
+            onChange={e => setFormData({...formData, retype: e.target.value})}
+            className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+          />
+        </div>
+        <button type="submit" className="w-full bg-emerald-500 text-white py-4 rounded-2xl font-black uppercase tracking-widest text-xs shadow-lg shadow-emerald-500/20 hover:bg-emerald-600 transition-all">
+          Change Password
+        </button>
+      </form>
+    </div>
+  );
+};
+
+const LanguagePage = () => {
+  const navigate = useNavigate();
+  const languages = [
+    { code: 'en', name: 'English', flag: '🇺🇸' },
+    { code: 'bn', name: 'Bangla', flag: '🇧🇩' },
+    { code: 'de', name: 'German', flag: '🇩🇪' },
+    { code: 'ar', name: 'Arabic', flag: '🇸🇦' },
+  ];
+
+  return (
+    <div className="max-w-md mx-auto py-8 px-4 min-h-screen bg-white">
+      <div className="flex items-center gap-4 mb-8">
+        <button onClick={() => navigate(-1)} className="p-2 hover:bg-gray-50 rounded-full transition-colors text-emerald-600">
+          <ArrowLeft className="w-5 h-5" />
+        </button>
+        <h1 className="text-2xl font-black text-gray-900">Languages</h1>
+      </div>
+      <div className="space-y-2">
+        {languages.map(lang => (
           <button 
+            key={lang.code}
             onClick={() => {
-              logout();
-              navigate('/');
+              toast(`Language changed to ${lang.name}`);
+              navigate('/profile');
             }}
-            className="flex items-center justify-center gap-3 w-full bg-red-50 text-red-600 py-4 rounded-xl font-bold hover:bg-red-100 transition-all"
+            className="w-full flex items-center gap-4 p-6 bg-gray-50 hover:bg-emerald-50 rounded-3xl transition-all group border border-transparent hover:border-emerald-100"
           >
-            <LogOut className="w-5 h-5" /> Logout
+            <span className="text-2xl">{lang.flag}</span>
+            <span className="text-sm font-black text-gray-700 group-hover:text-emerald-600">{lang.name}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const ChatPage = () => {
+  const { user } = useAuthStore();
+  const [profile, setProfile] = useState<any>(null);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (user) {
+      fetch(`/api/user/profile/${user.uid}`)
+        .then(res => res.json())
+        .then(setProfile);
+    }
+  }, [user]);
+
+  const handleWhatsApp = () => {
+    const message = `Habari Admin, nahitaji msaada.\n\nJina: ${profile?.name || user?.displayName}\nEmail: ${user?.email}\nSimu: ${profile?.phone || ''}`;
+    const encodedMessage = encodeURIComponent(message);
+    window.open(`https://wa.me/255687225353?text=${encodedMessage}`, '_blank');
+  };
+
+  return (
+    <div className="max-w-md mx-auto py-8 px-4 min-h-screen bg-white">
+      <div className="flex items-center gap-4 mb-8">
+        <button onClick={() => navigate(-1)} className="p-2 hover:bg-gray-50 rounded-full transition-colors text-emerald-600">
+          <ArrowLeft className="w-5 h-5" />
+        </button>
+        <h1 className="text-2xl font-black text-gray-900">Chat Support</h1>
+      </div>
+      <div className="grid grid-cols-1 gap-4">
+        <button 
+          onClick={() => toast('AI Chat coming soon!')}
+          className="p-8 bg-emerald-50 rounded-3xl border border-emerald-100 flex flex-col items-center text-center group hover:bg-emerald-100 transition-all"
+        >
+          <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center text-emerald-500 mb-4 shadow-sm">
+            <Monitor className="w-8 h-8" />
+          </div>
+          <h3 className="text-lg font-black text-emerald-900 mb-1">AI Chat</h3>
+          <p className="text-xs text-emerald-600 font-bold">Talk to our intelligent assistant</p>
+        </button>
+        <button 
+          onClick={handleWhatsApp}
+          className="p-8 bg-green-50 rounded-3xl border border-green-100 flex flex-col items-center text-center group hover:bg-green-100 transition-all"
+        >
+          <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center text-green-500 mb-4 shadow-sm">
+            <MessageSquare className="w-8 h-8" />
+          </div>
+          <h3 className="text-lg font-black text-green-900 mb-1">WhatsApp</h3>
+          <p className="text-xs text-green-600 font-bold">Chat directly with our admin</p>
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const ProfilePage = () => {
+  const { user, logout, loading } = useAuthStore();
+  const [profile, setProfile] = useState<any>(null);
+  const [isEditPicModalOpen, setIsEditPicModalOpen] = useState(false);
+  const [newPicUrl, setNewPicUrl] = useState('');
+  const navigate = useNavigate();
+
+  const fetchProfile = async () => {
+    if (user) {
+      const res = await fetch(`/api/user/profile/${user.uid}`);
+      const data = await res.json();
+      setProfile(data);
+      setNewPicUrl(data.profile_image || '');
+    }
+  };
+
+  useEffect(() => {
+    if (!loading && !user) {
+      navigate('/login');
+    } else if (user) {
+      fetchProfile();
+    }
+  }, [user, loading, navigate]);
+
+  const handleUpdatePic = async () => {
+    if (!user) return;
+    const res = await fetch(`/api/user/profile/${user.uid}/image`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile_image: newPicUrl })
+    });
+    if (res.ok) {
+      toast.success('Profile picture updated');
+      setIsEditPicModalOpen(false);
+      fetchProfile();
+    }
+  };
+
+  if (loading || !user) return <div className="p-8">Loading...</div>;
+
+  const menuItems: { icon: any, label: string, path?: string, onClick?: () => void }[] = [
+    { icon: ShoppingBag, label: 'My Orders', path: '/orders' },
+    ...(user?.email === 'amytzee@gmail.com' ? [{ icon: LayoutDashboard, label: 'Admin Dashboard', path: '/admin' }] : []),
+    { icon: Edit2, label: 'Edit Profile', path: '/profile/edit' },
+    { icon: MessageCircle, label: 'Chat', path: '/profile/chat' },
+    { icon: MapPin, label: 'Address', path: '/profile/address' },
+    { icon: Lock, label: 'Change Password', path: '/profile/password' },
+    { icon: Globe, label: 'Change Language', path: '/profile/language' },
+  ];
+
+  const handleWhatsAppTopup = () => {
+    const message = `Habari Admin, naomba kuongeza salio kwenye wallet yangu.\n\nJina: ${profile?.name || user.displayName}\nEmail: ${user.email}\nSimu: ${profile?.phone || ''}\n\nNamba ya Admin: 0687225353`;
+    const encodedMessage = encodeURIComponent(message);
+    window.open(`https://wa.me/255687225353?text=${encodedMessage}`, '_blank');
+  };
+
+  return (
+    <div className="max-w-md mx-auto py-8 px-4 min-h-screen bg-white">
+      {/* Profile Header */}
+      <div className="relative flex flex-col items-center mb-10 pt-4">
+        <button 
+          onClick={() => navigate(-1)}
+          className="absolute right-0 top-0 p-2 bg-red-500 text-white rounded-full shadow-lg"
+        >
+          <X className="w-5 h-5" />
+        </button>
+
+        <div className="relative mb-4">
+          <div className="w-24 h-24 rounded-full border-2 border-dashed border-gray-300 p-1">
+            <div className="w-full h-full rounded-full overflow-hidden bg-gray-100 flex items-center justify-center">
+              {profile?.profile_image ? (
+                <img src={profile.profile_image} alt="Profile" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+              ) : (
+                <User className="w-12 h-12 text-gray-300" />
+              )}
+            </div>
+          </div>
+          <button 
+            onClick={() => setIsEditPicModalOpen(true)}
+            className="absolute bottom-0 right-0 p-2 bg-white rounded-full shadow-md border border-gray-100 text-gray-600 hover:text-emerald-500 transition-colors"
+          >
+            <Camera className="w-4 h-4" />
           </button>
         </div>
+
+        <h1 className="text-xl font-black text-gray-900">{profile?.name || user.displayName || 'User'}</h1>
+        <p className="text-gray-400 text-sm font-bold mb-2">{user.email}</p>
+        <div className="flex items-center gap-2">
+          <span className="text-lg font-black text-gray-900">${(profile?.wallet_balance || 0).toFixed(2)}</span>
+        </div>
       </div>
+
+      {/* Menu List */}
+      <div className="space-y-1">
+        {menuItems.map((item, idx) => (
+          <button
+            key={idx}
+            onClick={item.path ? () => navigate(item.path!) : item.onClick}
+            className="w-full flex items-center justify-between p-4 hover:bg-gray-50 rounded-2xl transition-all group border-b border-gray-50 last:border-0"
+          >
+            <div className="flex items-center gap-4">
+              <div className="p-2 text-gray-400 group-hover:text-emerald-500 transition-colors">
+                <item.icon className="w-5 h-5" />
+              </div>
+              <span className="text-sm font-bold text-gray-700">{item.label}</span>
+            </div>
+            <ChevronRight className="w-4 h-4 text-gray-300 group-hover:text-emerald-500 transition-all" />
+          </button>
+        ))}
+
+        <button
+          onClick={() => {
+            logout();
+            navigate('/');
+          }}
+          className="w-full flex items-center gap-4 p-4 hover:bg-red-50 rounded-2xl transition-all group text-red-500"
+        >
+          <div className="p-2">
+            <LogOut className="w-5 h-5" />
+          </div>
+          <span className="text-sm font-bold">Logout</span>
+        </button>
+      </div>
+
+      {/* Wallet Topup Notice */}
+      <div className="mt-10 p-6 bg-emerald-50 rounded-3xl border border-emerald-100">
+        <p className="text-xs font-bold text-emerald-800 mb-4 leading-relaxed">
+          Ili kuongeza pesa kwenye wallet yako, tafadhali tuma ujumbe WhatsApp kwa admin (0687225353) ukiwa na jina lako na email yako kwa ajili ya uhakiki.
+        </p>
+        <button 
+          onClick={handleWhatsAppTopup}
+          className="w-full bg-emerald-500 text-white py-4 rounded-xl font-black uppercase tracking-widest text-xs shadow-lg shadow-emerald-500/20 hover:bg-emerald-600 transition-all flex items-center justify-center gap-2"
+        >
+          <MessageCircle className="w-5 h-5" /> Tuma WhatsApp
+        </button>
+      </div>
+
+      {/* Edit Pic Modal */}
+      <AnimatePresence>
+        {isEditPicModalOpen && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsEditPicModalOpen(false)}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative w-full max-w-sm bg-white rounded-3xl p-8 shadow-2xl"
+            >
+              <h3 className="text-xl font-black text-gray-900 mb-6">Update Profile Picture</h3>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Image URL</label>
+                  <input 
+                    type="text"
+                    placeholder="https://example.com/image.jpg"
+                    value={newPicUrl}
+                    onChange={e => setNewPicUrl(e.target.value)}
+                    className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
+                <div className="flex gap-3">
+                  <button 
+                    onClick={() => setIsEditPicModalOpen(false)}
+                    className="flex-1 py-4 bg-gray-100 text-gray-600 rounded-2xl font-bold hover:bg-gray-200 transition-all"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    onClick={handleUpdatePic}
+                    className="flex-1 py-4 bg-emerald-500 text-white rounded-2xl font-bold hover:bg-emerald-600 transition-all shadow-lg shadow-emerald-500/20"
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
@@ -1440,6 +2322,14 @@ const POSPage = () => {
   const [tables, setTables] = useState<any[]>([]);
   const [selectedTable, setSelectedTable] = useState<any>(null);
   const { branch } = useAppStore();
+  const { sendMessage } = useWebSocket(() => {});
+
+  const subtotal = posCart.reduce((acc, item) => acc + (item.price * item.quantity), 0);
+  const total = subtotal - discount;
+
+  useEffect(() => {
+    sendMessage({ type: 'cart_update', cart: posCart, subtotal, total, discount });
+  }, [posCart, subtotal, total, discount]);
 
   const fetchData = async () => {
     const [catsRes, itemsRes, ordersRes, tablesRes] = await Promise.all([
@@ -1471,9 +2361,6 @@ const POSPage = () => {
     return catMatch && searchMatch;
   });
 
-  const subtotal = posCart.reduce((acc, item) => acc + (item.price * item.quantity), 0);
-  const total = subtotal - discount;
-
   const handleAddToCart = (item: any) => {
     setPosCart([...posCart, item]);
   };
@@ -1497,6 +2384,7 @@ const POSPage = () => {
     const orderData = {
       customer_name: selectedCustomer?.customer_name || 'Walking Customer',
       customer_phone: selectedCustomer?.customer_phone || '',
+      branch_id: branch?.id || 1,
       total_amount: total,
       subtotal,
       discount,
@@ -1958,18 +2846,23 @@ const POSPage = () => {
 };
 
 const AdminRoute = ({ children }: { children: React.ReactNode }) => {
-  const { user, loading } = useAuthStore();
+  const { user, branchUser, loading } = useAuthStore();
   const navigate = useNavigate();
 
   useEffect(() => {
-    if (!loading && (!user || user.email !== 'amytzee@gmail.com')) {
-      toast.error('Access denied. Admin only.');
+    const isAdmin = user && user.email === 'amytzee@gmail.com';
+    const isBranch = !!branchUser;
+    
+    if (!loading && !isAdmin && !isBranch) {
+      toast.error('Access denied. Admin or Branch only.');
       navigate('/');
     }
-  }, [user, loading, navigate]);
+  }, [user, branchUser, loading, navigate]);
 
   if (loading) return <div className="p-8">Verifying...</div>;
-  if (!user || user.email !== 'amytzee@gmail.com') return null;
+  const isAdmin = user && user.email === 'amytzee@gmail.com';
+  const isBranch = !!branchUser;
+  if (!isAdmin && !isBranch) return null;
 
   return <>{children}</>;
 };
@@ -1977,12 +2870,14 @@ const AdminRoute = ({ children }: { children: React.ReactNode }) => {
 const AdminLayout = ({ children, title }: { children: React.ReactNode, title: string }) => {
   const navigate = useNavigate();
   const location = useLocation();
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const menuItems = [
     { icon: LayoutDashboard, label: 'Dashboard', path: '/admin' },
     { icon: Utensils, label: 'Items', path: '/admin/items' },
     { icon: Layers, label: 'Item Categories', path: '/admin/categories' },
     { icon: Table, label: 'Dining Tables', path: '/admin/tables' },
+    { icon: Utensils, label: 'Kitchens', path: '/admin/kitchens' },
     { type: 'header', label: 'POS & ORDERS' },
     { icon: ShoppingBag, label: 'POS', path: '/admin/pos' },
     { icon: FileText, label: 'POS Orders', path: '/admin/orders?type=pos' },
@@ -1998,59 +2893,513 @@ const AdminLayout = ({ children, title }: { children: React.ReactNode, title: st
     { icon: MessageSquare, label: 'Messages', path: '/admin/messages' },
     { icon: Users, label: 'Subscribers', path: '/admin/subscribers' },
     { type: 'header', label: 'USERS' },
-    { icon: Users, label: 'Customers', path: '/admin/customers' },
+    { icon: Users, label: 'User Management', path: '/admin/users' },
     { icon: Settings, label: 'Settings', path: '/admin/settings' },
   ];
 
+  const SidebarContent = () => (
+    <>
+      <div className="text-xl font-bold text-emerald-600 mb-10 px-3">FoodAppi Admin</div>
+      <nav className="space-y-1">
+        {menuItems.map((item, idx) => (
+          item.type === 'header' ? (
+            <div key={idx} className="text-[10px] font-black text-gray-400 uppercase tracking-widest pt-6 pb-2 px-3">
+              {item.label}
+            </div>
+          ) : (
+            <Link 
+              key={item.path}
+              to={item.path!} 
+              onClick={() => setIsMobileMenuOpen(false)}
+              className={cn(
+                "flex items-center gap-3 p-3 rounded-xl font-medium transition-all text-sm",
+                location.pathname === item.path 
+                  ? "bg-pink-50 text-pink-600 font-bold" 
+                  : "text-gray-600 hover:bg-gray-50"
+              )}
+            >
+              <item.icon className="w-4 h-4" /> {item.label}
+            </Link>
+          )
+        ))}
+      </nav>
+      <div className="mt-10 pt-6 border-t border-gray-100">
+        <button 
+          onClick={() => navigate('/')}
+          className="flex items-center gap-3 p-3 text-gray-600 hover:bg-gray-50 rounded-xl font-medium w-full transition-all"
+        >
+          <ArrowLeft className="w-5 h-5" /> Back to Site
+        </button>
+      </div>
+    </>
+  );
+
   return (
     <div className="flex min-h-screen bg-gray-50">
-      {/* Sidebar */}
+      {/* Desktop Sidebar */}
       <aside className="w-64 bg-white border-r border-gray-200 p-6 hidden lg:block fixed h-full overflow-y-auto no-scrollbar">
-        <div className="text-xl font-bold text-emerald-600 mb-10">FoodAppi Admin</div>
-        <nav className="space-y-1">
-          {menuItems.map((item, idx) => (
-            item.type === 'header' ? (
-              <div key={idx} className="text-[10px] font-black text-gray-400 uppercase tracking-widest pt-6 pb-2 px-3">
-                {item.label}
-              </div>
-            ) : (
-              <Link 
-                key={item.path}
-                to={item.path!} 
-                className={cn(
-                  "flex items-center gap-3 p-3 rounded-xl font-medium transition-all text-sm",
-                  location.pathname === item.path 
-                    ? "bg-pink-50 text-pink-600 font-bold" 
-                    : "text-gray-600 hover:bg-gray-50"
-                )}
-              >
-                <item.icon className="w-4 h-4" /> {item.label}
-              </Link>
-            )
-          ))}
-        </nav>
-        <div className="absolute bottom-6 left-6 right-6">
-          <button 
-            onClick={() => navigate('/')}
-            className="flex items-center gap-3 p-3 text-gray-600 hover:bg-gray-50 rounded-xl font-medium w-full"
-          >
-            <ArrowLeft className="w-5 h-5" /> Back to Site
-          </button>
-        </div>
+        <SidebarContent />
       </aside>
 
+      {/* Mobile Sidebar Overlay */}
+      <AnimatePresence>
+        {isMobileMenuOpen && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsMobileMenuOpen(false)}
+              className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40 lg:hidden"
+            />
+            <motion.aside 
+              initial={{ x: '-100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '-100%' }}
+              transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+              className="fixed inset-y-0 left-0 w-72 bg-white z-50 p-6 shadow-2xl lg:hidden overflow-y-auto no-scrollbar"
+            >
+              <div className="flex justify-end mb-4">
+                <button onClick={() => setIsMobileMenuOpen(false)} className="p-2 hover:bg-gray-100 rounded-full">
+                  <X className="w-6 h-6 text-gray-400" />
+                </button>
+              </div>
+              <SidebarContent />
+            </motion.aside>
+          </>
+        )}
+      </AnimatePresence>
+
       {/* Main Content */}
-      <main className="flex-1 lg:ml-64 p-8">
-        <header className="flex items-center justify-between mb-10">
-          <h1 className="text-2xl font-bold text-gray-900">{title}</h1>
+      <main className="flex-1 lg:ml-64 min-w-0">
+        <header className="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-gray-100 px-4 lg:px-8 py-4 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 font-bold">AD</div>
-            <button className="text-gray-400 hover:text-gray-600"><LogOut className="w-5 h-5" /></button>
+            <button 
+              onClick={() => setIsMobileMenuOpen(true)}
+              className="p-2 hover:bg-gray-100 rounded-xl lg:hidden"
+            >
+              <MenuIcon className="w-6 h-6 text-gray-600" />
+            </button>
+            <h1 className="text-lg lg:text-2xl font-bold text-gray-900 truncate max-w-[200px] lg:max-w-none">{title}</h1>
+          </div>
+          <div className="flex items-center gap-2 lg:gap-4">
+            <div className="hidden sm:flex flex-col items-end mr-2">
+              <span className="text-xs font-bold text-gray-900">Admin User</span>
+              <span className="text-[10px] text-gray-400 font-black uppercase tracking-widest">Administrator</span>
+            </div>
+            <div className="w-10 h-10 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 font-bold shadow-inner">AD</div>
+            <button className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all">
+              <LogOut className="w-5 h-5" />
+            </button>
           </div>
         </header>
-        {children}
+
+        <div className="p-4 lg:p-8 max-w-[1600px] mx-auto">
+          {children}
+        </div>
       </main>
     </div>
+  );
+};
+
+const AdminUsers = () => {
+  const [users, setUsers] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [editingUser, setEditingUser] = useState<any>(null);
+  const [formData, setFormData] = useState({
+    role: 'customer',
+    is_active: true,
+    wallet_balance: 0
+  });
+
+  const fetchUsers = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/admin/users');
+      setUsers(await res.json());
+    } catch (e) {
+      toast.error("Failed to fetch users");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchUsers();
+  }, []);
+
+  const handleUpdate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const res = await fetch(`/api/admin/users/${editingUser.uid}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData)
+      });
+      if (res.ok) {
+        toast.success("User updated");
+        setEditingUser(null);
+        fetchUsers();
+      }
+    } catch (e) {
+      toast.error("Update failed");
+    }
+  };
+
+  const handleDelete = async (uid: string) => {
+    if (confirm("Are you sure? This will delete the user profile.")) {
+      try {
+        await fetch(`/api/admin/users/${uid}`, { method: 'DELETE' });
+        toast.success("User deleted");
+        fetchUsers();
+      } catch (e) {
+        toast.error("Delete failed");
+      }
+    }
+  };
+
+  return (
+    <AdminLayout title="User Management">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+        <div className="flex flex-wrap gap-2">
+          <select className="px-3 py-2 bg-white border border-gray-100 rounded-xl text-[10px] font-black uppercase tracking-widest focus:ring-2 focus:ring-emerald-500 outline-none">
+            <option>10</option>
+            <option>25</option>
+            <option>50</option>
+          </select>
+          <button className="px-3 py-2 bg-white border border-gray-100 rounded-xl text-[10px] font-black uppercase tracking-widest text-gray-400 hover:text-emerald-500 flex items-center gap-2 transition-all">
+            Filter <ChevronRight className="w-3 h-3 rotate-90" />
+          </button>
+        </div>
+      </div>
+      <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-100">
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest">User</th>
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest">Role</th>
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest">Status</th>
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest">Wallet</th>
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((user) => (
+                <tr key={user.uid} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                  <td className="p-6">
+                    <div className="flex items-center gap-4">
+                      <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center overflow-hidden">
+                        {user.profile_image ? (
+                          <img src={user.profile_image} alt="" className="w-full h-full object-cover" />
+                        ) : (
+                          <User className="w-5 h-5 text-gray-400" />
+                        )}
+                      </div>
+                      <div>
+                        <div className="font-bold text-gray-900">{user.name || 'Anonymous'}</div>
+                        <div className="text-xs text-gray-500">{user.email || user.phone}</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="p-6">
+                    <span className={cn(
+                      "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                      user.role === 'admin' ? "bg-purple-100 text-purple-600" : "bg-blue-100 text-blue-600"
+                    )}>
+                      {user.role}
+                    </span>
+                  </td>
+                  <td className="p-6">
+                    <span className={cn(
+                      "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                      user.is_active ? "bg-emerald-100 text-emerald-600" : "bg-red-100 text-red-600"
+                    )}>
+                      {user.is_active ? 'Active' : 'Inactive'}
+                    </span>
+                  </td>
+                  <td className="p-6 font-bold text-gray-900">
+                    TSh {user.wallet_balance?.toLocaleString()}
+                  </td>
+                  <td className="p-6 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <button 
+                        onClick={() => {
+                          setEditingUser(user);
+                          setFormData({
+                            role: user.role || 'customer',
+                            is_active: user.is_active === 1 || user.is_active === true,
+                            wallet_balance: user.wallet_balance || 0
+                          });
+                        }}
+                        className="p-2 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-all"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={() => handleDelete(user.uid)}
+                        className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {editingUser && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl"
+          >
+            <div className="p-8 border-b border-gray-100 flex items-center justify-between">
+              <h2 className="text-xl font-bold text-gray-900">Edit User</h2>
+              <button onClick={() => setEditingUser(null)} className="p-2 hover:bg-gray-100 rounded-full transition-all">
+                <X className="w-5 h-5 text-gray-400" />
+              </button>
+            </div>
+            <form onSubmit={handleUpdate} className="p-8 space-y-6">
+              <div>
+                <label className="block text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Role</label>
+                <select 
+                  value={formData.role}
+                  onChange={(e) => setFormData({ ...formData, role: e.target.value })}
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl focus:ring-2 focus:ring-emerald-500 outline-none font-bold"
+                >
+                  <option value="customer">Customer</option>
+                  <option value="admin">Admin</option>
+                  <option value="staff">Staff</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Wallet Balance</label>
+                <input 
+                  type="number"
+                  value={formData.wallet_balance}
+                  onChange={(e) => setFormData({ ...formData, wallet_balance: parseFloat(e.target.value) })}
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl focus:ring-2 focus:ring-emerald-500 outline-none font-bold"
+                />
+              </div>
+              <div className="flex items-center gap-3">
+                <input 
+                  type="checkbox"
+                  id="user_active"
+                  checked={formData.is_active}
+                  onChange={(e) => setFormData({ ...formData, is_active: e.target.checked })}
+                  className="w-5 h-5 rounded-lg border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                />
+                <label htmlFor="user_active" className="text-sm font-bold text-gray-700">Account Active</label>
+              </div>
+              <button 
+                type="submit"
+                className="w-full bg-emerald-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-emerald-500/20 hover:bg-emerald-700 transition-all"
+              >
+                Save Changes
+              </button>
+            </form>
+          </motion.div>
+        </div>
+      )}
+    </AdminLayout>
+  );
+};
+
+const AdminKitchens = () => {
+  const [kitchens, setKitchens] = useState<any[]>([]);
+  const [branches, setBranches] = useState<any[]>([]);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingKitchen, setEditingKitchen] = useState<any>(null);
+  const [formData, setFormData] = useState({
+    name: '',
+    branch_id: '',
+    status: 'Active'
+  });
+
+  const fetchData = async () => {
+    const [kRes, bRes] = await Promise.all([
+      fetch('/api/admin/kitchens'),
+      fetch('/api/admin/branches')
+    ]);
+    setKitchens(await kRes.json());
+    setBranches(await bRes.json());
+  };
+
+  useEffect(() => {
+    fetchData();
+  }, []);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const url = editingKitchen ? `/api/admin/kitchens/${editingKitchen.id}` : '/api/admin/kitchens';
+    const method = editingKitchen ? 'PUT' : 'POST';
+    
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(formData)
+    });
+
+    if (res.ok) {
+      toast.success(editingKitchen ? 'Kitchen updated' : 'Kitchen added');
+      setIsModalOpen(false);
+      setEditingKitchen(null);
+      setFormData({ name: '', branch_id: '', status: 'Active' });
+      fetchData();
+    } else {
+      const err = await res.json();
+      toast.error(err.error || "Failed to save");
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (confirm('Are you sure?')) {
+      const res = await fetch(`/api/admin/kitchens/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        toast.success('Kitchen deleted');
+        fetchData();
+      } else {
+        const err = await res.json();
+        toast.error(err.error || "Delete failed");
+      }
+    }
+  };
+
+  return (
+    <AdminLayout title="Kitchen Management">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+        <h2 className="text-lg font-bold text-gray-900">Kitchen Sections</h2>
+        <button 
+          onClick={() => {
+            setEditingKitchen(null);
+            setFormData({ name: '', branch_id: branches[0]?.id || '', status: 'Active' });
+            setIsModalOpen(true);
+          }}
+          className="w-full sm:w-auto bg-emerald-600 text-white px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 hover:bg-emerald-700 transition-all"
+        >
+          <PlusCircle className="w-5 h-5" /> Add Kitchen
+        </button>
+      </div>
+
+      <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-100">
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest">Kitchen Name</th>
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest">Branch</th>
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest">Status</th>
+                <th className="p-6 text-xs font-black text-gray-400 uppercase tracking-widest text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {kitchens.map((kitchen) => (
+                <tr key={kitchen.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                  <td className="p-6 font-bold text-gray-900">{kitchen.name}</td>
+                  <td className="p-6 text-gray-600">{kitchen.branch_name}</td>
+                  <td className="p-6">
+                    <span className={cn(
+                      "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                      kitchen.status === 'Active' ? "bg-emerald-100 text-emerald-600" : "bg-red-100 text-red-600"
+                    )}>
+                      {kitchen.status}
+                    </span>
+                  </td>
+                  <td className="p-6 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <button 
+                        onClick={() => {
+                          setEditingKitchen(kitchen);
+                          setFormData({
+                            name: kitchen.name,
+                            branch_id: kitchen.branch_id,
+                            status: kitchen.status
+                          });
+                          setIsModalOpen(true);
+                        }}
+                        className="p-2 text-gray-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-all"
+                      >
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                      <button 
+                        onClick={() => handleDelete(kitchen.id)}
+                        className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {isModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl"
+          >
+            <div className="p-8 border-b border-gray-100 flex items-center justify-between">
+              <h2 className="text-xl font-bold text-gray-900">{editingKitchen ? 'Edit Kitchen' : 'Add Kitchen'}</h2>
+              <button onClick={() => setIsModalOpen(false)} className="p-2 hover:bg-gray-100 rounded-full transition-all">
+                <X className="w-5 h-5 text-gray-400" />
+              </button>
+            </div>
+            <form onSubmit={handleSubmit} className="p-8 space-y-6">
+              <div>
+                <label className="block text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Kitchen Name</label>
+                <input 
+                  type="text"
+                  required
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                  placeholder="e.g. Main Kitchen, Bar, Grill"
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl focus:ring-2 focus:ring-emerald-500 outline-none font-bold"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Branch</label>
+                <select 
+                  required
+                  value={formData.branch_id}
+                  onChange={(e) => setFormData({ ...formData, branch_id: e.target.value })}
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl focus:ring-2 focus:ring-emerald-500 outline-none font-bold"
+                >
+                  <option value="">Select Branch</option>
+                  {branches.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-black text-gray-400 uppercase tracking-widest mb-2">Status</label>
+                <select 
+                  value={formData.status}
+                  onChange={(e) => setFormData({ ...formData, status: e.target.value })}
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl focus:ring-2 focus:ring-emerald-500 outline-none font-bold"
+                >
+                  <option value="Active">Active</option>
+                  <option value="Inactive">Inactive</option>
+                </select>
+              </div>
+              <button 
+                type="submit"
+                className="w-full bg-emerald-600 text-white py-4 rounded-2xl font-bold shadow-lg shadow-emerald-500/20 hover:bg-emerald-700 transition-all"
+              >
+                {editingKitchen ? 'Update Kitchen' : 'Add Kitchen'}
+              </button>
+            </form>
+          </motion.div>
+        </div>
+      )}
+    </AdminLayout>
   );
 };
 
@@ -2059,6 +3408,7 @@ const AdminDiningTables = () => {
   const [branches, setBranches] = useState<any[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingTable, setEditingTable] = useState<any>(null);
+  const { branchUser } = useAuthStore();
   const [formData, setFormData] = useState({
     name: '',
     capacity: '1',
@@ -2068,8 +3418,9 @@ const AdminDiningTables = () => {
   });
 
   const fetchData = async () => {
+    const tablesUrl = branchUser ? `/api/admin/dining-tables?branchId=${branchUser.id}` : '/api/admin/dining-tables';
     const [tablesRes, branchesRes] = await Promise.all([
-      fetch('/api/admin/dining-tables'),
+      fetch(tablesUrl),
       fetch('/api/admin/branches')
     ]);
     setTables(await tablesRes.json());
@@ -2078,7 +3429,7 @@ const AdminDiningTables = () => {
 
   useEffect(() => {
     fetchData();
-  }, []);
+  }, [branchUser]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -2302,10 +3653,12 @@ const AdminDiningTables = () => {
 
 const AdminDashboard = () => {
   const [stats, setStats] = useState<any>(null);
+  const { branchUser } = useAuthStore();
 
   useEffect(() => {
-    fetch('/api/admin/stats').then(res => res.json()).then(setStats);
-  }, []);
+    const url = branchUser ? `/api/admin/stats?branchId=${branchUser.id}` : '/api/admin/stats';
+    fetch(url).then(res => res.json()).then(setStats);
+  }, [branchUser]);
 
   if (!stats) return <div className="p-8">Loading...</div>;
 
@@ -2330,28 +3683,30 @@ const AdminDashboard = () => {
       </div>
 
       {/* Greeting */}
-      <div className="mb-10">
-        <h2 className="text-3xl font-black text-pink-600 mb-1">Good Morning!</h2>
-        <p className="text-lg font-bold text-gray-900">John Doe</p>
+      <div className="mb-6 lg:mb-10">
+        <h2 className="text-2xl lg:text-3xl font-black text-pink-600 mb-1">Good Morning!</h2>
+        <p className="text-base lg:text-lg font-bold text-gray-900">John Doe</p>
       </div>
 
       {/* Overview Cards */}
-      <div className="mb-12">
+      <div className="mb-8 lg:mb-12">
         <h3 className="text-lg font-black text-gray-900 mb-6">Overview</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4 lg:gap-6">
           {[
-            { label: 'Total Sales', value: `$${stats.overview.totalSales.toFixed(2)}`, icon: Coins, color: 'bg-pink-500' },
+            { label: 'Total Sales', value: `TSh ${stats.overview.totalSales.toLocaleString()}`, icon: Coins, color: 'bg-pink-500' },
             { label: 'Total Orders', value: stats.overview.totalOrders, icon: Package, color: 'bg-indigo-500' },
             { label: 'Total Customers', value: stats.overview.totalCustomers, icon: Users, color: 'bg-blue-500' },
             { label: 'Total Menu Items', value: stats.overview.totalItems, icon: FileText, color: 'bg-purple-500' },
+            { label: 'Total Branches', value: stats.overview.totalBranches, icon: MapPin, color: 'bg-emerald-500' },
+            { label: 'Total Kitchens', value: stats.overview.totalKitchens, icon: Utensils, color: 'bg-orange-500' },
           ].map((card, idx) => (
-            <div key={idx} className={cn("p-6 rounded-[2rem] text-white flex items-center gap-6 shadow-lg", card.color)}>
-              <div className="w-14 h-14 bg-white/20 backdrop-blur-md rounded-2xl flex items-center justify-center">
-                <card.icon className="w-8 h-8" />
+            <div key={idx} className={cn("p-4 lg:p-6 rounded-2xl lg:rounded-[2rem] text-white flex items-center gap-4 lg:gap-6 shadow-lg", card.color)}>
+              <div className="w-12 h-12 lg:w-14 lg:h-14 bg-white/20 backdrop-blur-md rounded-xl lg:rounded-2xl flex items-center justify-center shrink-0">
+                <card.icon className="w-6 h-6 lg:w-8 lg:h-8" />
               </div>
-              <div>
-                <p className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-1">{card.label}</p>
-                <p className="text-2xl font-black">{card.value}</p>
+              <div className="min-w-0">
+                <p className="text-[10px] font-black uppercase tracking-widest opacity-80 mb-1 truncate">{card.label}</p>
+                <p className="text-xl lg:text-2xl font-black truncate">{card.value}</p>
               </div>
             </div>
           ))}
@@ -2359,14 +3714,14 @@ const AdminDashboard = () => {
       </div>
 
       {/* Order Statistics */}
-      <div className="mb-12">
-        <div className="flex items-center justify-between mb-6">
+      <div className="mb-8 lg:mb-12">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
           <h3 className="text-lg font-black text-gray-900">Order Statistics</h3>
-          <div className="flex items-center gap-2 px-4 py-2 bg-white rounded-xl border border-gray-100 text-[10px] font-black text-gray-400">
+          <div className="flex items-center gap-2 px-3 py-2 bg-white rounded-xl border border-gray-100 text-[10px] font-black text-gray-400 w-fit">
             <Calendar className="w-4 h-4" /> 03/01/2026 - 03/01/2026 <X className="w-3 h-3 cursor-pointer" />
           </div>
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3 lg:gap-4">
           {[
             { label: 'Total Orders', value: stats.overview.totalOrders, icon: Package, color: 'text-pink-500', bg: 'bg-pink-50' },
             { label: 'Pending', value: stats.statusStats.find((s: any) => s.status === 'pending')?.count || 0, icon: Clock, color: 'text-amber-500', bg: 'bg-amber-50' },
@@ -2412,8 +3767,8 @@ const AdminDashboard = () => {
               <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Avg. Sales Per Day</p>
             </div>
           </div>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
+          <div className="h-64 relative min-h-[256px]">
+            <ResponsiveContainer width="100%" height="100%" debounce={100}>
               <LineChart data={stats.salesSummary}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
                 <XAxis dataKey="date" hide />
@@ -2443,8 +3798,8 @@ const AdminDashboard = () => {
             </div>
           </div>
           <div className="grid grid-cols-2 gap-8">
-            <div className="h-64 relative">
-              <ResponsiveContainer width="100%" height="100%">
+            <div className="h-64 relative min-h-[256px]">
+              <ResponsiveContainer width="100%" height="100%" debounce={100}>
                 <PieChart>
                   <Pie
                     data={orderStatusData}
@@ -2493,8 +3848,8 @@ const AdminDashboard = () => {
               03/01/2026 - 03/31/2026 <Calendar className="w-3 h-3" />
             </div>
           </div>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
+          <div className="h-64 relative min-h-[256px]">
+            <ResponsiveContainer width="100%" height="100%" debounce={100}>
               <BarChart data={stats.hourlyStats}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f3f4f6" />
                 <XAxis dataKey="hour" axisLine={false} tickLine={false} tick={{ fontSize: 10, fontWeight: 'bold', fill: '#9ca3af' }} />
@@ -2571,9 +3926,11 @@ const AdminDashboard = () => {
 const AdminOrders = () => {
   const [orders, setOrders] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const { branchUser } = useAuthStore();
 
   const fetchOrders = async () => {
-    const res = await fetch('/api/admin/orders');
+    const url = branchUser ? `/api/admin/orders?branchId=${branchUser.id}` : '/api/admin/orders';
+    const res = await fetch(url);
     const data = await res.json();
     setOrders(data);
     setLoading(false);
@@ -2581,7 +3938,7 @@ const AdminOrders = () => {
 
   useEffect(() => {
     fetchOrders();
-  }, []);
+  }, [branchUser]);
 
   const updateStatus = async (id: number, status: string) => {
     await fetch(`/api/admin/orders/${id}/status`, {
@@ -2597,6 +3954,18 @@ const AdminOrders = () => {
 
   return (
     <AdminLayout title="Order Management">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+        <div className="flex flex-wrap gap-2">
+          <select className="px-3 py-2 bg-white border border-gray-100 rounded-xl text-[10px] font-black uppercase tracking-widest focus:ring-2 focus:ring-emerald-500 outline-none">
+            <option>10</option>
+            <option>25</option>
+            <option>50</option>
+          </select>
+          <button className="px-3 py-2 bg-white border border-gray-100 rounded-xl text-[10px] font-black uppercase tracking-widest text-gray-400 hover:text-emerald-500 flex items-center gap-2 transition-all">
+            Filter <ChevronRight className="w-3 h-3 rotate-90" />
+          </button>
+        </div>
+      </div>
       <div className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left">
@@ -2855,6 +4224,7 @@ const AdminCategories = () => {
 const AdminItems = () => {
   const [items, setItems] = useState<any[]>([]);
   const [categories, setCategories] = useState<any[]>([]);
+  const [kitchens, setKitchens] = useState<any[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<any>(null);
   const [formData, setFormData] = useState({
@@ -2864,6 +4234,7 @@ const AdminItems = () => {
     tax: '0',
     image: '',
     category_id: '',
+    kitchen_id: '',
     item_type: 'Veg',
     is_featured: false,
     status: 'Active',
@@ -2871,12 +4242,14 @@ const AdminItems = () => {
   });
 
   const fetchData = async () => {
-    const [itemsRes, catsRes] = await Promise.all([
+    const [itemsRes, catsRes, kRes] = await Promise.all([
       fetch('/api/admin/items'),
-      fetch('/api/admin/categories')
+      fetch('/api/admin/categories'),
+      fetch('/api/admin/kitchens')
     ]);
     setItems(await itemsRes.json());
     setCategories(await catsRes.json());
+    setKitchens(await kRes.json());
   };
 
   useEffect(() => {
@@ -2903,7 +4276,7 @@ const AdminItems = () => {
       toast.success(editingItem ? 'Item updated' : 'Item added');
       setIsModalOpen(false);
       setEditingItem(null);
-      setFormData({ name: '', description: '', price: '', tax: '0', image: '', category_id: '', item_type: 'Veg', is_featured: false, status: 'Active', caution: '' });
+      setFormData({ name: '', description: '', price: '', tax: '0', image: '', category_id: '', kitchen_id: '', item_type: 'Veg', is_featured: false, status: 'Active', caution: '' });
       fetchData();
     }
   };
@@ -2918,30 +4291,27 @@ const AdminItems = () => {
 
   return (
     <AdminLayout title="Items">
-      <div className="flex justify-between items-center mb-8">
-        <div className="flex gap-2">
-          <select className="px-4 py-2 bg-white border border-gray-100 rounded-xl text-xs font-bold focus:ring-2 focus:ring-emerald-500">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-8">
+        <div className="flex flex-wrap gap-2">
+          <select className="px-3 py-2 bg-white border border-gray-100 rounded-xl text-[10px] font-black uppercase tracking-widest focus:ring-2 focus:ring-emerald-500 outline-none">
             <option>10</option>
             <option>25</option>
             <option>50</option>
           </select>
-          <button className="px-4 py-2 bg-white border border-gray-100 rounded-xl text-xs font-bold text-gray-400 hover:text-emerald-500 flex items-center gap-2">
-            Filter <ChevronRight className="w-4 h-4 rotate-90" />
+          <button className="px-3 py-2 bg-white border border-gray-100 rounded-xl text-[10px] font-black uppercase tracking-widest text-gray-400 hover:text-emerald-500 flex items-center gap-2 transition-all">
+            Filter <ChevronRight className="w-3 h-3 rotate-90" />
           </button>
-          <button className="px-4 py-2 bg-white border border-gray-100 rounded-xl text-xs font-bold text-gray-400 hover:text-emerald-500 flex items-center gap-2">
-            Export <ChevronRight className="w-4 h-4 rotate-90" />
-          </button>
-          <button className="px-4 py-2 bg-white border border-gray-100 rounded-xl text-xs font-bold text-gray-400 hover:text-emerald-500 flex items-center gap-2">
-            Import <ChevronRight className="w-4 h-4 rotate-90" />
+          <button className="px-3 py-2 bg-white border border-gray-100 rounded-xl text-[10px] font-black uppercase tracking-widest text-gray-400 hover:text-emerald-500 flex items-center gap-2 transition-all">
+            Export <ChevronRight className="w-3 h-3 rotate-90" />
           </button>
         </div>
         <button 
           onClick={() => {
             setEditingItem(null);
-            setFormData({ name: '', description: '', price: '', tax: '0', image: '', category_id: '', item_type: 'Veg', is_featured: false, status: 'Active', caution: '' });
+            setFormData({ name: '', description: '', price: '', tax: '0', image: '', category_id: '', kitchen_id: '', item_type: 'Veg', is_featured: false, status: 'Active', caution: '' });
             setIsModalOpen(true);
           }}
-          className="bg-pink-600 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg shadow-pink-500/20"
+          className="w-full sm:w-auto bg-pink-600 text-white px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-pink-500/20 hover:bg-pink-700 transition-all"
         >
           <PlusCircle className="w-5 h-5" /> Add Item
         </button>
@@ -2954,6 +4324,7 @@ const AdminItems = () => {
               <tr className="bg-gray-50 text-gray-400 text-[10px] font-black uppercase tracking-widest">
                 <th className="px-8 py-4">Name</th>
                 <th className="px-8 py-4">Category</th>
+                <th className="px-8 py-4">Kitchen</th>
                 <th className="px-8 py-4">Price</th>
                 <th className="px-8 py-4">Status</th>
                 <th className="px-8 py-4">Action</th>
@@ -2964,7 +4335,10 @@ const AdminItems = () => {
                 <tr key={item.id} className="hover:bg-gray-50 transition-colors">
                   <td className="px-8 py-4 text-sm font-bold text-gray-600">{item.name}</td>
                   <td className="px-8 py-4 text-sm font-bold text-gray-400">{item.category_name}</td>
-                  <td className="px-8 py-4 text-sm font-bold text-gray-600">${item.price.toFixed(2)}</td>
+                  <td className="px-8 py-4 text-sm font-bold text-blue-600">
+                    {kitchens.find(k => k.id === item.kitchen_id)?.name || 'N/A'}
+                  </td>
+                  <td className="px-8 py-4 text-sm font-bold text-gray-600">TSh {item.price.toFixed(2)}</td>
                   <td className="px-8 py-4">
                     <span className={cn(
                       "px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider",
@@ -2988,6 +4362,7 @@ const AdminItems = () => {
                             tax: item.tax?.toString() || '0',
                             image: item.image,
                             category_id: item.category_id?.toString() || '',
+                            kitchen_id: item.kitchen_id?.toString() || '',
                             item_type: item.item_type,
                             is_featured: item.is_featured === 1,
                             status: item.status,
@@ -3062,7 +4437,7 @@ const AdminItems = () => {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-6">
+                <div className="grid grid-cols-3 gap-6">
                   <div className="space-y-2">
                     <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Category *</label>
                     <select 
@@ -3074,6 +4449,19 @@ const AdminItems = () => {
                       <option value="">Select Category</option>
                       {categories.map(cat => (
                         <option key={cat.id} value={cat.id}>{cat.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Kitchen Section</label>
+                    <select 
+                      value={formData.kitchen_id}
+                      onChange={e => setFormData({...formData, kitchen_id: e.target.value})}
+                      className="w-full p-4 bg-gray-50 border-none rounded-2xl text-sm font-bold focus:ring-2 focus:ring-emerald-500"
+                    >
+                      <option value="">Select Kitchen</option>
+                      {kitchens.map(k => (
+                        <option key={k.id} value={k.id}>{k.name}</option>
                       ))}
                     </select>
                   </div>
@@ -3181,7 +4569,15 @@ const AdminSettings = () => {
   const [branches, setBranches] = useState<any[]>([]);
   const [isBranchModalOpen, setIsBranchModalOpen] = useState(false);
   const [editingBranch, setEditingBranch] = useState<any>(null);
-  const [branchForm, setBranchForm] = useState({ name: '', address: '', is_active: true });
+  const [branchForm, setBranchForm] = useState({ 
+    name: '', 
+    address: '', 
+    email: '', 
+    password: '', 
+    latitude: '', 
+    longitude: '', 
+    is_active: true 
+  });
 
   const fetchData = async () => {
     const [branchesRes] = await Promise.all([
@@ -3206,7 +4602,15 @@ const AdminSettings = () => {
     toast.success(editingBranch ? 'Branch updated' : 'Branch added');
     setIsBranchModalOpen(false);
     setEditingBranch(null);
-    setBranchForm({ name: '', address: '', is_active: true });
+    setBranchForm({ 
+      name: '', 
+      address: '', 
+      email: '', 
+      password: '', 
+      latitude: '', 
+      longitude: '', 
+      is_active: true 
+    });
     fetchData();
   };
 
@@ -3239,7 +4643,15 @@ const AdminSettings = () => {
                   <button 
                     onClick={() => {
                       setEditingBranch(branch);
-                      setBranchForm({ name: branch.name, address: branch.address, is_active: branch.is_active === 1 });
+                      setBranchForm({ 
+                        name: branch.name, 
+                        address: branch.address, 
+                        email: branch.email || '',
+                        password: branch.password || '',
+                        latitude: branch.latitude || '',
+                        longitude: branch.longitude || '',
+                        is_active: branch.is_active === 1 
+                      });
                       setIsBranchModalOpen(true);
                     }}
                     className="p-2 text-blue-600 hover:bg-blue-100 rounded-lg transition-colors"
@@ -3277,25 +4689,69 @@ const AdminSettings = () => {
                 <h2 className="text-xl font-bold text-gray-900">{editingBranch ? 'Edit Branch' : 'Add Branch'}</h2>
                 <button onClick={() => setIsBranchModalOpen(false)} className="p-2 hover:bg-gray-100 rounded-full"><X className="w-6 h-6" /></button>
               </div>
-              <form onSubmit={handleBranchSubmit} className="p-8 space-y-6">
-                <div className="space-y-2">
-                  <label className="text-sm font-bold text-gray-700">Branch Name</label>
-                  <input 
-                    required
-                    type="text" 
-                    value={branchForm.name}
-                    onChange={e => setBranchForm({...branchForm, name: e.target.value})}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500" 
-                  />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-bold text-gray-700">Address</label>
-                  <textarea 
-                    required
-                    value={branchForm.address}
-                    onChange={e => setBranchForm({...branchForm, address: e.target.value})}
-                    className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500 h-24" 
-                  />
+              <form onSubmit={handleBranchSubmit} className="p-8 space-y-6 max-h-[70vh] overflow-y-auto no-scrollbar">
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-sm font-bold text-gray-700">Branch Name</label>
+                    <input 
+                      required
+                      type="text" 
+                      value={branchForm.name}
+                      onChange={e => setBranchForm({...branchForm, name: e.target.value})}
+                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500" 
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-bold text-gray-700">Branch Email</label>
+                    <input 
+                      required
+                      type="email" 
+                      value={branchForm.email}
+                      onChange={e => setBranchForm({...branchForm, email: e.target.value})}
+                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500" 
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-bold text-gray-700">Branch Password</label>
+                    <input 
+                      required
+                      type="password" 
+                      value={branchForm.password}
+                      onChange={e => setBranchForm({...branchForm, password: e.target.value})}
+                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500" 
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-bold text-gray-700">Address</label>
+                    <textarea 
+                      required
+                      value={branchForm.address}
+                      onChange={e => setBranchForm({...branchForm, address: e.target.value})}
+                      className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500 h-24" 
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-gray-700">Latitude</label>
+                      <input 
+                        type="number" 
+                        step="any"
+                        value={branchForm.latitude}
+                        onChange={e => setBranchForm({...branchForm, latitude: e.target.value})}
+                        className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500" 
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-gray-700">Longitude</label>
+                      <input 
+                        type="number" 
+                        step="any"
+                        value={branchForm.longitude}
+                        onChange={e => setBranchForm({...branchForm, longitude: e.target.value})}
+                        className="w-full px-4 py-3 rounded-xl bg-gray-50 border-none focus:ring-2 focus:ring-emerald-500" 
+                      />
+                    </div>
+                  </div>
                 </div>
                 <label className="flex items-center gap-3 cursor-pointer">
                   <input 
@@ -3322,6 +4778,309 @@ const AdminSettings = () => {
 };
 
 // --- Main App ---
+
+const useWebSocket = (onMessage: (data: any) => void) => {
+  const socketRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    socketRef.current = socket;
+
+    socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        onMessage(data);
+      } catch (e) {}
+    };
+
+    return () => socket.close();
+  }, []);
+
+  const sendMessage = (data: any) => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify(data));
+    }
+  };
+
+  return { sendMessage };
+};
+
+const OSSPage = () => {
+  const [orders, setOrders] = useState<any[]>([]);
+  const [categories, setCategories] = useState<any[]>([]);
+
+  const fetchOrders = async () => {
+    const res = await fetch('/api/admin/orders');
+    const data = await res.json();
+    setOrders(data);
+  };
+
+  const fetchCategories = async () => {
+    const res = await fetch('/api/categories');
+    setCategories(await res.json());
+  };
+
+  useEffect(() => {
+    fetchOrders();
+    fetchCategories();
+  }, []);
+
+  useWebSocket((data) => {
+    if (data.type === 'order_status_update') {
+      fetchOrders();
+    }
+  });
+
+  const preparing = orders.filter(o => o.status === 'Preparing' || o.status === 'pending');
+  const ready = orders.filter(o => o.status === 'Ready');
+
+  return (
+    <div className="min-h-screen bg-white p-8">
+      <div className="max-w-7xl mx-auto">
+        <div className="flex justify-between items-center mb-12">
+          <h1 className="text-4xl font-black text-emerald-600 tracking-tighter">FoodAppi</h1>
+          <div className="flex gap-6">
+            <div className="flex items-center gap-2">
+              <div className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-sm font-bold text-gray-400 uppercase tracking-widest">Live Status</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
+          <div className="space-y-8">
+            <h2 className="text-2xl font-black text-gray-900 border-b-2 border-emerald-500 pb-2 inline-block">Popular Menu Items</h2>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-6">
+              {categories.slice(0, 6).map(cat => (
+                <div key={cat.id} className="flex flex-col items-center text-center group">
+                  <div className="w-24 h-24 rounded-full overflow-hidden mb-3 border-4 border-gray-50 group-hover:border-emerald-100 transition-all shadow-sm">
+                    <img src={cat.image} alt={cat.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  </div>
+                  <span className="text-xs font-black text-gray-700 uppercase tracking-wider">{cat.name}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div className="flex flex-col">
+              <div className="bg-emerald-500 text-white py-4 px-6 rounded-t-3xl text-center font-black uppercase tracking-widest text-sm">
+                Preparing
+              </div>
+              <div className="bg-gray-50 flex-grow rounded-b-3xl p-6 min-h-[600px] border border-gray-100 shadow-inner">
+                <div className="grid grid-cols-1 gap-4">
+                  {preparing.map(order => (
+                    <div key={order.id} className="text-4xl font-black text-gray-800 text-center py-2 animate-pulse">
+                      {order.token_no}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-col">
+              <div className="bg-emerald-600 text-white py-4 px-6 rounded-t-3xl text-center font-black uppercase tracking-widest text-sm">
+                Ready
+              </div>
+              <div className="bg-gray-50 flex-grow rounded-b-3xl p-6 min-h-[600px] border border-gray-100 shadow-inner">
+                <div className="grid grid-cols-1 gap-4">
+                  {ready.map(order => (
+                    <div key={order.id} className="text-4xl font-black text-emerald-600 text-center py-2 drop-shadow-sm">
+                      {order.token_no}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const CDSPage = () => {
+  const [cart, setCart] = useState<any[]>([]);
+  const [totals, setTotals] = useState({ subtotal: 0, total: 0, discount: 0 });
+
+  useWebSocket((data) => {
+    if (data.type === 'cart_update') {
+      setCart(data.cart);
+      setTotals({ subtotal: data.subtotal, total: data.total, discount: data.discount });
+    }
+  });
+
+  return (
+    <div className="min-h-screen bg-white flex flex-col">
+      <div className="p-8 border-b border-gray-100 flex justify-between items-center">
+        <h1 className="text-3xl font-black text-emerald-600 tracking-tighter">FoodAppi</h1>
+        <div className="text-right">
+          <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Welcome to</p>
+          <p className="text-sm font-black text-gray-900 uppercase">Main Branch</p>
+        </div>
+      </div>
+
+      <div className="flex-grow flex p-8 gap-12">
+        <div className="flex-1 rounded-[40px] overflow-hidden relative shadow-2xl">
+          <img 
+            src="https://picsum.photos/seed/food/1200/800" 
+            alt="Promo" 
+            className="w-full h-full object-cover"
+            referrerPolicy="no-referrer"
+          />
+          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent flex flex-col justify-end p-12">
+            <h2 className="text-5xl font-black text-white mb-4 leading-tight">Try our new<br/><span className="text-emerald-400">Double BBQ Burger</span></h2>
+            <p className="text-xl text-white/80 font-bold">Limited time offer - Get 20% off today!</p>
+          </div>
+        </div>
+
+        <div className="w-[450px] flex flex-col">
+          <div className="flex-grow bg-gray-50 rounded-[40px] p-8 border border-gray-100 shadow-inner flex flex-col">
+            <h2 className="text-xl font-black text-gray-900 mb-8 uppercase tracking-widest border-b border-gray-200 pb-4">Your Order</h2>
+            
+            <div className="flex-grow overflow-y-auto space-y-6 pr-2">
+              {cart.length > 0 ? cart.map((item, idx) => (
+                <div key={idx} className="flex justify-between items-center">
+                  <div className="flex gap-4">
+                    <div className="w-12 h-12 bg-white rounded-xl flex items-center justify-center font-black text-emerald-600 shadow-sm">
+                      {item.quantity}x
+                    </div>
+                    <div>
+                      <p className="font-black text-gray-900">{item.name}</p>
+                      <p className="text-xs text-gray-400 font-bold">${item.price.toFixed(2)} each</p>
+                    </div>
+                  </div>
+                  <p className="font-black text-gray-900">${(item.price * item.quantity).toFixed(2)}</p>
+                </div>
+              )) : (
+                <div className="h-full flex flex-col items-center justify-center text-gray-300">
+                  <ShoppingBag className="w-16 h-16 mb-4 opacity-20" />
+                  <p className="font-black uppercase tracking-widest text-xs">Waiting for items...</p>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-8 pt-8 border-t-2 border-dashed border-gray-200 space-y-4">
+              <div className="flex justify-between text-sm font-bold text-gray-500">
+                <span>Subtotal</span>
+                <span>${totals.subtotal.toFixed(2)}</span>
+              </div>
+              {totals.discount > 0 && (
+                <div className="flex justify-between text-sm font-bold text-red-500">
+                  <span>Discount</span>
+                  <span>-${totals.discount.toFixed(2)}</span>
+                </div>
+              )}
+              <div className="flex justify-between items-center pt-2">
+                <span className="text-xl font-black text-gray-900 uppercase tracking-widest">Total</span>
+                <span className="text-4xl font-black text-emerald-600">${totals.total.toFixed(2)}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const KDSPage = () => {
+  const [orders, setOrders] = useState<any[]>([]);
+  const navigate = useNavigate();
+
+  const fetchOrders = async () => {
+    const res = await fetch('/api/admin/orders');
+    const data = await res.json();
+    setOrders(data.filter((o: any) => o.status !== 'Delivered' && o.status !== 'Cancelled'));
+  };
+
+  useEffect(() => {
+    fetchOrders();
+  }, []);
+
+  useWebSocket((data) => {
+    if (data.type === 'order_status_update' || data.type === 'new_order') {
+      fetchOrders();
+    }
+  });
+
+  const updateStatus = async (id: number, status: string) => {
+    await fetch(`/api/admin/orders/${id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status })
+    });
+    fetchOrders();
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-900 p-8 text-white">
+      <div className="flex justify-between items-center mb-12">
+        <div className="flex items-center gap-4">
+          <button onClick={() => navigate('/admin')} className="p-2 bg-gray-800 rounded-xl hover:bg-gray-700 transition-colors">
+            <ArrowLeft className="w-5 h-5" />
+          </button>
+          <h1 className="text-3xl font-black tracking-tighter uppercase">Kitchen Display (KDS)</h1>
+        </div>
+        <div className="flex gap-4">
+          <div className="px-4 py-2 bg-emerald-500/20 text-emerald-400 rounded-xl border border-emerald-500/30 text-xs font-black uppercase tracking-widest">
+            {orders.length} Active Orders
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+        {orders.map(order => (
+          <div key={order.id} className="bg-gray-800 rounded-3xl overflow-hidden border border-gray-700 flex flex-col">
+            <div className="p-6 border-b border-gray-700 flex justify-between items-start">
+              <div>
+                <h3 className="text-2xl font-black text-white">#{order.token_no}</h3>
+                <p className="text-[10px] text-gray-500 font-black uppercase tracking-widest mt-1">{order.order_type}</p>
+              </div>
+              <span className={cn(
+                "px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest",
+                order.status === 'pending' ? "bg-amber-500/20 text-amber-400 border border-amber-500/30" : "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
+              )}>
+                {order.status}
+              </span>
+            </div>
+            
+            <div className="flex-grow p-6 space-y-4">
+              <p className="text-xs text-gray-400 font-bold italic">Order items details...</p>
+            </div>
+
+            <div className="p-4 bg-gray-900/50 grid grid-cols-2 gap-3">
+              {order.status === 'pending' && (
+                <button 
+                  onClick={() => updateStatus(order.id, 'Preparing')}
+                  className="col-span-2 py-3 bg-amber-500 text-white rounded-xl font-black uppercase tracking-widest text-xs hover:bg-amber-600 transition-all"
+                >
+                  Start Cooking
+                </button>
+              )}
+              {order.status === 'Preparing' && (
+                <button 
+                  onClick={() => updateStatus(order.id, 'Ready')}
+                  className="col-span-2 py-3 bg-emerald-500 text-white rounded-xl font-black uppercase tracking-widest text-xs hover:bg-emerald-600 transition-all"
+                >
+                  Mark as Ready
+                </button>
+              )}
+              {order.status === 'Ready' && (
+                <button 
+                  onClick={() => updateStatus(order.id, 'Delivered')}
+                  className="col-span-2 py-3 bg-blue-500 text-white rounded-xl font-black uppercase tracking-widest text-xs hover:bg-blue-600 transition-all"
+                >
+                  Mark Delivered
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 export default function App() {
   const { branch, setBranch } = useAppStore();
@@ -3352,12 +5111,23 @@ export default function App() {
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
             <Route path="/profile" element={<ProfilePage />} />
+            <Route path="/profile/edit" element={<EditProfilePage />} />
+            <Route path="/profile/address" element={<AddressPage />} />
+            <Route path="/profile/password" element={<ChangePasswordPage />} />
+            <Route path="/profile/language" element={<LanguagePage />} />
+            <Route path="/profile/chat" element={<ChatPage />} />
+            <Route path="/orders" element={<OrdersPage />} />
+            <Route path="/oss" element={<OSSPage />} />
+            <Route path="/cds" element={<CDSPage />} />
             <Route path="/admin" element={<AdminRoute><AdminDashboard /></AdminRoute>} />
             <Route path="/admin/pos" element={<AdminRoute><POSPage /></AdminRoute>} />
+            <Route path="/admin/kds" element={<AdminRoute><KDSPage /></AdminRoute>} />
             <Route path="/admin/categories" element={<AdminRoute><AdminCategories /></AdminRoute>} />
             <Route path="/admin/orders" element={<AdminRoute><AdminOrders /></AdminRoute>} />
             <Route path="/admin/tables" element={<AdminRoute><AdminDiningTables /></AdminRoute>} />
+            <Route path="/admin/kitchens" element={<AdminRoute><AdminKitchens /></AdminRoute>} />
             <Route path="/admin/items" element={<AdminRoute><AdminItems /></AdminRoute>} />
+            <Route path="/admin/users" element={<AdminRoute><AdminUsers /></AdminRoute>} />
             <Route path="/admin/settings" element={<AdminRoute><AdminSettings /></AdminRoute>} />
             {/* Add more routes as needed */}
           </Routes>

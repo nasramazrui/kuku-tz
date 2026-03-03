@@ -3,10 +3,13 @@ import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
+import { WebSocketServer, WebSocket } from "ws";
+import http from "http";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+console.log("Initializing database...");
 const db = new Database("foodappi.db");
 db.pragma('foreign_keys = ON');
 
@@ -17,6 +20,14 @@ db.exec(`
     name TEXT NOT NULL,
     image TEXT,
     status TEXT DEFAULT 'Active'
+  );
+
+  CREATE TABLE IF NOT EXISTS kitchens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    branch_id INTEGER,
+    status TEXT DEFAULT 'Active',
+    FOREIGN KEY (branch_id) REFERENCES branches(id)
   );
 
   CREATE TABLE IF NOT EXISTS items (
@@ -32,13 +43,19 @@ db.exec(`
     status TEXT DEFAULT 'Active', -- 'Active', 'Inactive'
     caution TEXT,
     options TEXT, -- JSON string for variations, extras, addons
-    FOREIGN KEY (category_id) REFERENCES categories(id)
+    kitchen_id INTEGER,
+    FOREIGN KEY (category_id) REFERENCES categories(id),
+    FOREIGN KEY (kitchen_id) REFERENCES kitchens(id)
   );
 
   CREATE TABLE IF NOT EXISTS branches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    email TEXT UNIQUE,
+    password TEXT,
     address TEXT,
+    latitude REAL,
+    longitude REAL,
     is_active BOOLEAN DEFAULT 1
   );
 
@@ -79,10 +96,26 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     uid TEXT UNIQUE,
     name TEXT UNIQUE,
+    first_name TEXT,
+    last_name TEXT,
     email TEXT UNIQUE,
     phone TEXT UNIQUE,
     whatsapp TEXT,
+    wallet_balance REAL DEFAULT 0,
+    profile_image TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS addresses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT,
+    label TEXT, -- 'Home', 'Work', etc.
+    address TEXT NOT NULL,
+    latitude REAL,
+    longitude REAL,
+    is_default BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (uid) REFERENCES users(uid)
   );
 
   CREATE TABLE IF NOT EXISTS dining_tables (
@@ -97,11 +130,38 @@ db.exec(`
   );
 `);
 
-// Add table_id to orders if not exists
-try {
-  db.exec("ALTER TABLE orders ADD COLUMN table_id INTEGER REFERENCES dining_tables(id)");
-} catch (e) {}
+console.log("Database initialized.");
 
+// Add missing columns to existing tables
+const migrations = [
+  "ALTER TABLE branches ADD COLUMN email TEXT UNIQUE",
+  "ALTER TABLE branches ADD COLUMN password TEXT",
+  "ALTER TABLE branches ADD COLUMN latitude REAL",
+  "ALTER TABLE branches ADD COLUMN longitude REAL",
+  "ALTER TABLE addresses ADD COLUMN latitude REAL",
+  "ALTER TABLE addresses ADD COLUMN longitude REAL",
+  "ALTER TABLE orders ADD COLUMN table_id INTEGER REFERENCES dining_tables(id)",
+  "ALTER TABLE users ADD COLUMN email TEXT UNIQUE",
+  "ALTER TABLE users ADD COLUMN phone TEXT UNIQUE",
+  "ALTER TABLE users ADD COLUMN whatsapp TEXT",
+  "ALTER TABLE users ADD COLUMN wallet_balance REAL DEFAULT 0",
+  "ALTER TABLE users ADD COLUMN profile_image TEXT",
+  "ALTER TABLE users ADD COLUMN first_name TEXT",
+  "ALTER TABLE users ADD COLUMN last_name TEXT",
+  "ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'customer'",
+  "ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT 1",
+  "ALTER TABLE items ADD COLUMN kitchen_id INTEGER REFERENCES kitchens(id)"
+];
+
+for (const migration of migrations) {
+  try {
+    db.exec(migration);
+  } catch (e) {
+    // Column already exists or other error
+  }
+}
+
+console.log("Seeding data...");
 // Seed admin user if not exists
 const adminExists = db.prepare("SELECT * FROM users WHERE email = ?").get("amytzee@gmail.com");
 if (!adminExists) {
@@ -116,28 +176,61 @@ if (categoryCount.count === 0) {
   db.prepare("INSERT INTO categories (name, image) VALUES (?, ?)").run("Pizza", "https://picsum.photos/seed/pizza/200/200");
   db.prepare("INSERT INTO categories (name, image) VALUES (?, ?)").run("Drinks", "https://picsum.photos/seed/drink/200/200");
   
-  db.prepare("INSERT INTO items (category_id, name, description, price, image, is_veg, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .run(1, "Classic Beef Burger", "Juicy beef patty with lettuce and tomato", 8.50, "https://picsum.photos/seed/beefburger/400/300", 0, 1);
-  db.prepare("INSERT INTO items (category_id, name, description, price, image, is_veg, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .run(1, "Veggie Delight", "Plant-based patty with avocado", 9.00, "https://picsum.photos/seed/vegburger/400/300", 1, 1);
-  db.prepare("INSERT INTO items (category_id, name, description, price, image, is_veg, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .run(2, "Margherita Pizza", "Fresh mozzarella and basil", 12.00, "https://picsum.photos/seed/margherita/400/300", 1, 0);
+  db.prepare("INSERT INTO items (category_id, name, description, price, image, item_type, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(1, "Classic Beef Burger", "Juicy beef patty with lettuce and tomato", 8.50, "https://picsum.photos/seed/beefburger/400/300", "Non Veg", 1);
+  db.prepare("INSERT INTO items (category_id, name, description, price, image, item_type, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(1, "Veggie Delight", "Plant-based patty with avocado", 9.00, "https://picsum.photos/seed/vegburger/400/300", "Veg", 1);
+  db.prepare("INSERT INTO items (category_id, name, description, price, image, item_type, is_featured) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(2, "Margherita Pizza", "Fresh mozzarella and basil", 12.00, "https://picsum.photos/seed/margherita/400/300", "Veg", 0);
     
   db.prepare("INSERT INTO branches (name, address) VALUES (?, ?)").run("Main Branch", "123 Food St, Dar es Salaam");
   db.prepare("INSERT INTO branches (name, address) VALUES (?, ?)").run("City Center", "456 Market Rd, Arusha");
 }
 
+console.log("Starting server...");
 async function startServer() {
   const app = express();
   app.use(express.json());
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ server });
+
+  const clients = new Set<WebSocket>();
+
+  wss.on("connection", (ws) => {
+    clients.add(ws);
+    ws.on("close", () => clients.delete(ws));
+    ws.on("message", (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+        if (data.type === 'cart_update') {
+          broadcast({ type: 'cart_update', cart: data.cart, subtotal: data.subtotal, total: data.total, discount: data.discount });
+        }
+      } catch (e) {}
+    });
+  });
+
+  function broadcast(data: any) {
+    const message = JSON.stringify(data);
+    clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(message);
+      }
+    });
+  }
+
+  app.locals.broadcast = broadcast;
 
   // Dining Tables API
   app.get("/api/admin/dining-tables", (req, res) => {
+    const branchId = req.query.branchId;
+    const where = branchId ? "WHERE branch_id = ?" : "";
+    const params = branchId ? [branchId] : [];
     const tables = db.prepare(`
       SELECT t.*, b.name as branch_name 
       FROM dining_tables t 
       LEFT JOIN branches b ON t.branch_id = b.id
-    `).all();
+      ${where}
+    `).all(...params);
     res.json(tables);
   });
 
@@ -148,6 +241,13 @@ async function startServer() {
 
   app.post("/api/admin/dining-tables", express.json(), (req, res) => {
     const { branch_id, name, capacity, status, qr_code } = req.body;
+    
+    // Check if branch exists
+    const branch = db.prepare("SELECT id FROM branches WHERE id = ?").get(branch_id);
+    if (!branch) {
+      return res.status(400).json({ error: "Invalid branch selected" });
+    }
+
     const result = db.prepare("INSERT INTO dining_tables (branch_id, name, capacity, status, qr_code) VALUES (?, ?, ?, ?, ?)")
       .run(branch_id, name, capacity, status, qr_code);
     res.json({ id: result.lastInsertRowid });
@@ -155,14 +255,29 @@ async function startServer() {
 
   app.put("/api/admin/dining-tables/:id", express.json(), (req, res) => {
     const { branch_id, name, capacity, status, qr_code, is_occupied } = req.body;
+
+    // Check if branch exists
+    const branch = db.prepare("SELECT id FROM branches WHERE id = ?").get(branch_id);
+    if (!branch) {
+      return res.status(400).json({ error: "Invalid branch selected" });
+    }
+
     db.prepare("UPDATE dining_tables SET branch_id = ?, name = ?, capacity = ?, status = ?, qr_code = ?, is_occupied = ? WHERE id = ?")
       .run(branch_id, name, capacity, status, qr_code, is_occupied ? 1 : 0, req.params.id);
     res.json({ success: true });
   });
 
   app.delete("/api/admin/dining-tables/:id", (req, res) => {
-    db.prepare("DELETE FROM dining_tables WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
+    try {
+      db.prepare("DELETE FROM dining_tables WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+        res.status(400).json({ error: "Cannot delete table because it has associated orders. Please deactivate it instead." });
+      } else {
+        res.status(500).json({ error: error.message });
+      }
+    }
   });
 
   // Update table occupancy status
@@ -240,6 +355,58 @@ async function startServer() {
     }
   });
 
+  app.patch("/api/user/profile/:uid/image", (req, res) => {
+    const { profile_image } = req.body;
+    db.prepare("UPDATE users SET profile_image = ? WHERE uid = ?").run(profile_image, req.params.uid);
+    res.json({ success: true });
+  });
+
+  app.put("/api/user/profile/:uid", (req, res) => {
+    const { first_name, last_name, phone } = req.body;
+    db.prepare("UPDATE users SET first_name = ?, last_name = ?, phone = ?, name = ? WHERE uid = ?")
+      .run(first_name, last_name, phone, `${first_name} ${last_name}`, req.params.uid);
+    res.json({ success: true });
+  });
+
+  // Addresses API
+  app.get("/api/user/addresses/:uid", (req, res) => {
+    const addresses = db.prepare("SELECT * FROM addresses WHERE uid = ? ORDER BY created_at DESC").all(req.params.uid);
+    res.json(addresses);
+  });
+
+  app.post("/api/user/addresses/:uid", (req, res) => {
+    const { label, address, is_default } = req.body;
+    
+    // Check if user exists
+    const user = db.prepare("SELECT id FROM users WHERE uid = ?").get(req.params.uid);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    if (is_default) {
+      db.prepare("UPDATE addresses SET is_default = 0 WHERE uid = ?").run(req.params.uid);
+    }
+    const result = db.prepare("INSERT INTO addresses (uid, label, address, is_default) VALUES (?, ?, ?, ?)")
+      .run(req.params.uid, label, address, is_default ? 1 : 0);
+    res.json({ id: result.lastInsertRowid });
+  });
+
+  app.delete("/api/user/addresses/:id", (req, res) => {
+    db.prepare("DELETE FROM addresses WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  });
+
+  app.get("/api/user/orders/:uid", (req, res) => {
+    const orders = db.prepare(`
+      SELECT o.*, u.name as customer_name, u.phone as customer_phone 
+      FROM orders o 
+      JOIN users u ON o.customer_uid = u.uid 
+      WHERE o.customer_uid = ? 
+      ORDER BY o.created_at DESC
+    `).all(req.params.uid);
+    res.json(orders);
+  });
+
   app.post("/api/orders", (req, res) => {
     let { 
       customer_name, 
@@ -256,6 +423,7 @@ async function startServer() {
       change_amount,
       transaction_id,
       address,
+      table_id,
       items 
     } = req.body;
     
@@ -269,6 +437,14 @@ async function startServer() {
       return res.status(400).json({ error: "No branch available to fulfill order" });
     }
 
+    // Check if table exists if provided
+    if (table_id) {
+      const table = db.prepare("SELECT id FROM dining_tables WHERE id = ?").get(table_id);
+      if (!table) {
+        table_id = null; // Reset if invalid
+      }
+    }
+
     const token_no = Math.floor(100 + Math.random() * 900).toString();
     
     try {
@@ -276,12 +452,12 @@ async function startServer() {
         INSERT INTO orders (
           customer_name, customer_phone, customer_uid, branch_id, total_amount, 
           subtotal, discount, vat, order_type, payment_method, 
-          received_amount, change_amount, transaction_id, address, token_no
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          received_amount, change_amount, transaction_id, address, token_no, table_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         customer_name, customer_phone, customer_uid, branch_id, total_amount,
         subtotal || total_amount, discount || 0, vat || 0, order_type, payment_method || 'cash',
-        received_amount || 0, change_amount || 0, transaction_id || null, address || null, token_no
+        received_amount || 0, change_amount || 0, transaction_id || null, address || null, token_no, table_id || null
       );
       
       const orderId = info.lastInsertRowid;
@@ -309,50 +485,60 @@ async function startServer() {
   });
 
   app.get("/api/admin/stats", (req, res) => {
-    const totalSales = db.prepare("SELECT SUM(total_amount) as total FROM orders").get() as { total: number };
-    const totalOrders = db.prepare("SELECT COUNT(*) as count FROM orders").get() as { count: number };
-    const totalCustomers = db.prepare("SELECT COUNT(DISTINCT customer_phone) as count FROM orders").get() as { count: number };
+    const branchId = req.query.branchId;
+    const where = branchId ? "WHERE branch_id = ?" : "";
+    const params = branchId ? [branchId] : [];
+
+    const totalSales = db.prepare(`SELECT SUM(total_amount) as total FROM orders ${where}`).get(...params) as { total: number };
+    const totalOrders = db.prepare(`SELECT COUNT(*) as count FROM orders ${where}`).get(...params) as { count: number };
+    const totalCustomers = db.prepare(`SELECT COUNT(DISTINCT customer_phone) as count FROM orders ${where}`).get(...params) as { count: number };
     const totalItems = db.prepare("SELECT COUNT(*) as count FROM items").get() as { count: number };
+    const totalBranches = db.prepare("SELECT COUNT(*) as count FROM branches").get() as { count: number };
+    const totalKitchens = db.prepare("SELECT COUNT(*) as count FROM kitchens").get() as { count: number };
     
     const statusStats = db.prepare(`
       SELECT status, COUNT(*) as count 
       FROM orders 
+      ${where}
       GROUP BY status
-    `).all() as { status: string, count: number }[];
+    `).all(...params) as { status: string, count: number }[];
 
     const salesSummary = db.prepare(`
       SELECT strftime('%Y-%m-%d', created_at) as date, SUM(total_amount) as total
       FROM orders
-      WHERE created_at >= date('now', '-30 days')
+      WHERE created_at >= date('now', '-30 days') ${branchId ? "AND branch_id = ?" : ""}
       GROUP BY date
       ORDER BY date ASC
-    `).all();
+    `).all(...params);
 
     const hourlyStats = db.prepare(`
       SELECT strftime('%H:00', created_at) as hour, COUNT(*) as count
       FROM orders
-      WHERE created_at >= date('now', '-1 day')
+      WHERE created_at >= date('now', '-1 day') ${branchId ? "AND branch_id = ?" : ""}
       GROUP BY hour
       ORDER BY hour ASC
-    `).all();
+    `).all(...params);
 
     const topCustomers = db.prepare(`
       SELECT customer_name, customer_phone, COUNT(*) as order_count
       FROM orders
+      ${where}
       GROUP BY customer_phone
       ORDER BY order_count DESC
       LIMIT 5
-    `).all();
+    `).all(...params);
 
     const popularItems = db.prepare(`
       SELECT i.name, i.price, c.name as category, COUNT(oi.id) as order_count, i.image
       FROM items i
       JOIN order_items oi ON i.id = oi.item_id
       JOIN categories c ON i.category_id = c.id
+      JOIN orders o ON oi.order_id = o.id
+      ${branchId ? "WHERE o.branch_id = ?" : ""}
       GROUP BY i.id
       ORDER BY order_count DESC
       LIMIT 6
-    `).all();
+    `).all(...params);
 
     const featuredItems = db.prepare("SELECT * FROM items WHERE is_featured = 1 LIMIT 8").all();
     
@@ -361,7 +547,9 @@ async function startServer() {
         totalSales: totalSales.total || 0,
         totalOrders: totalOrders.count,
         totalCustomers: totalCustomers.count,
-        totalItems: totalItems.count
+        totalItems: totalItems.count,
+        totalBranches: totalBranches.count,
+        totalKitchens: totalKitchens.count
       },
       statusStats,
       salesSummary,
@@ -369,18 +557,35 @@ async function startServer() {
       topCustomers,
       popularItems,
       featuredItems,
-      recentOrders: db.prepare("SELECT * FROM orders ORDER BY created_at DESC LIMIT 5").all()
+      recentOrders: db.prepare(`SELECT * FROM orders ${where} ORDER BY created_at DESC LIMIT 5`).all(...params)
     });
   });
 
   // Admin Orders
   app.get("/api/admin/orders", (req, res) => {
+    const branchId = req.query.branchId;
+    const type = req.query.type;
+    let where = [];
+    let params = [];
+    
+    if (branchId) {
+      where.push("o.branch_id = ?");
+      params.push(branchId);
+    }
+    if (type) {
+      where.push("o.order_type = ?");
+      params.push(type);
+    }
+    
+    const whereClause = where.length > 0 ? "WHERE " + where.join(" AND ") : "";
+    
     const orders = db.prepare(`
       SELECT o.*, b.name as branch_name 
       FROM orders o 
       LEFT JOIN branches b ON o.branch_id = b.id 
+      ${whereClause}
       ORDER BY o.created_at DESC
-    `).all();
+    `).all(...params);
     res.json(orders);
   });
 
@@ -401,6 +606,11 @@ async function startServer() {
   app.patch("/api/admin/orders/:id/status", (req, res) => {
     const { status } = req.body;
     db.prepare("UPDATE orders SET status = ? WHERE id = ?").run(status, req.params.id);
+    
+    // Broadcast status update for OSS
+    const order = db.prepare("SELECT * FROM orders WHERE id = ?").get() as any;
+    req.app.locals.broadcast({ type: 'order_status_update', orderId: req.params.id, status, token_no: order?.token_no });
+    
     res.json({ success: true });
   });
 
@@ -416,6 +626,13 @@ async function startServer() {
 
   app.post("/api/admin/items", (req, res) => {
     const { name, description, price, tax, image, category_id, item_type, is_featured, status, caution, options } = req.body;
+    
+    // Check if category exists
+    const category = db.prepare("SELECT id FROM categories WHERE id = ?").get(category_id);
+    if (!category) {
+      return res.status(400).json({ error: "Invalid category selected" });
+    }
+
     const info = db.prepare(`
       INSERT INTO items (name, description, price, tax, image, category_id, item_type, is_featured, status, caution, options)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -425,6 +642,13 @@ async function startServer() {
 
   app.put("/api/admin/items/:id", (req, res) => {
     const { name, description, price, tax, image, category_id, item_type, is_featured, status, caution, options } = req.body;
+
+    // Check if category exists
+    const category = db.prepare("SELECT id FROM categories WHERE id = ?").get(category_id);
+    if (!category) {
+      return res.status(400).json({ error: "Invalid category selected" });
+    }
+
     db.prepare(`
       UPDATE items 
       SET name = ?, description = ?, price = ?, tax = ?, image = ?, category_id = ?, item_type = ?, is_featured = ?, status = ?, caution = ?, options = ?
@@ -434,8 +658,26 @@ async function startServer() {
   });
 
   app.delete("/api/admin/items/:id", (req, res) => {
-    db.prepare("DELETE FROM items WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
+    try {
+      db.prepare("DELETE FROM items WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+        res.status(400).json({ error: "Cannot delete item because it is part of existing orders. You should deactivate it instead." });
+      } else {
+        res.status(500).json({ error: error.message });
+      }
+    }
+  });
+
+  app.post("/api/auth/branch-login", (req, res) => {
+    const { email, password } = req.body;
+    const branch = db.prepare("SELECT * FROM branches WHERE email = ? AND password = ?").get(email, password);
+    if (branch) {
+      res.json({ success: true, branch });
+    } else {
+      res.status(401).json({ success: false, message: "Invalid branch credentials" });
+    }
   });
 
   // Admin Categories
@@ -457,8 +699,16 @@ async function startServer() {
   });
 
   app.delete("/api/admin/categories/:id", (req, res) => {
-    db.prepare("DELETE FROM categories WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
+    try {
+      db.prepare("DELETE FROM categories WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+        res.status(400).json({ error: "Cannot delete category because it has associated items. Please delete the items first." });
+      } else {
+        res.status(500).json({ error: error.message });
+      }
+    }
   });
 
   // Admin Branches
@@ -468,23 +718,86 @@ async function startServer() {
   });
 
   app.post("/api/admin/branches", (req, res) => {
-    const { name, address, is_active } = req.body;
-    const info = db.prepare("INSERT INTO branches (name, address, is_active) VALUES (?, ?, ?)").run(name, address, is_active ? 1 : 0);
+    const { name, address, email, password, latitude, longitude, is_active } = req.body;
+    const info = db.prepare("INSERT INTO branches (name, address, email, password, latitude, longitude, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)").run(name, address, email, password, latitude, longitude, is_active ? 1 : 0);
     res.json({ success: true, id: info.lastInsertRowid });
   });
 
   app.put("/api/admin/branches/:id", (req, res) => {
-    const { name, address, is_active } = req.body;
-    db.prepare("UPDATE branches SET name = ?, address = ?, is_active = ? WHERE id = ?").run(name, address, is_active ? 1 : 0, req.params.id);
+    const { name, address, email, password, latitude, longitude, is_active } = req.body;
+    db.prepare("UPDATE branches SET name = ?, address = ?, email = ?, password = ?, latitude = ?, longitude = ?, is_active = ? WHERE id = ?").run(name, address, email, password, latitude, longitude, is_active ? 1 : 0, req.params.id);
     res.json({ success: true });
   });
 
   app.delete("/api/admin/branches/:id", (req, res) => {
-    db.prepare("DELETE FROM branches WHERE id = ?").run(req.params.id);
-    res.json({ success: true });
+    try {
+      db.prepare("DELETE FROM branches WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+        res.status(400).json({ error: "Cannot delete branch because it has associated orders or dining tables. Please delete them first or deactivate the branch instead." });
+      } else {
+        res.status(500).json({ error: error.message });
+      }
+    }
   });
 
-  // Vite middleware for development
+  // Admin Users
+app.get("/api/admin/users", (req, res) => {
+  const users = db.prepare("SELECT * FROM users ORDER BY created_at DESC").all();
+  res.json(users);
+});
+
+app.put("/api/admin/users/:uid", (req, res) => {
+  const { role, is_active, wallet_balance } = req.body;
+  db.prepare("UPDATE users SET role = ?, is_active = ?, wallet_balance = ? WHERE uid = ?")
+    .run(role || 'customer', is_active ? 1 : 0, wallet_balance || 0, req.params.uid);
+  res.json({ success: true });
+});
+
+app.delete("/api/admin/users/:uid", (req, res) => {
+  db.prepare("DELETE FROM users WHERE uid = ?").run(req.params.uid);
+  res.json({ success: true });
+});
+
+// Admin Kitchens
+app.get("/api/admin/kitchens", (req, res) => {
+  const kitchens = db.prepare(`
+    SELECT k.*, b.name as branch_name 
+    FROM kitchens k 
+    LEFT JOIN branches b ON k.branch_id = b.id
+  `).all();
+  res.json(kitchens);
+});
+
+app.post("/api/admin/kitchens", (req, res) => {
+  const { name, branch_id, status } = req.body;
+  const info = db.prepare("INSERT INTO kitchens (name, branch_id, status) VALUES (?, ?, ?)")
+    .run(name, branch_id, status || 'Active');
+  res.json({ success: true, id: info.lastInsertRowid });
+});
+
+app.put("/api/admin/kitchens/:id", (req, res) => {
+  const { name, branch_id, status } = req.body;
+  db.prepare("UPDATE kitchens SET name = ?, branch_id = ?, status = ? WHERE id = ?")
+    .run(name, branch_id, status || 'Active', req.params.id);
+  res.json({ success: true });
+});
+
+app.delete("/api/admin/kitchens/:id", (req, res) => {
+  try {
+    db.prepare("DELETE FROM kitchens WHERE id = ?").run(req.params.id);
+    res.json({ success: true });
+  } catch (error: any) {
+    if (error.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
+      res.status(400).json({ error: "Cannot delete kitchen because it has associated items. Please reassign items first." });
+    } else {
+      res.status(500).json({ error: error.message });
+    }
+  }
+});
+
+// Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -498,7 +811,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  server.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }
